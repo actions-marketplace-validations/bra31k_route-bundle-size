@@ -1,0 +1,17 @@
+[
+  {
+    "route": "/api/foo",
+    "firstLoadUncompressedJsBytes": 100000,
+    "firstLoadChunkPaths": [".next/static/chunks/abc.js"]
+  },
+  {
+    "route": "/",
+    "firstLoadUncompressedJsBytes": 1000000,
+    "firstLoadChunkPaths": [".next/static/chunks/abc.js", ".next/static/chunks/home.js"]
+  },
+  {
+    "route": "/projects/[id]",
+    "firstLoadUncompressedJsBytes": 1500000,
+    "firstLoadChunkPaths": [".next/static/chunks/abc.js", ".next/static/chunks/projects.js"]
+  }
+]

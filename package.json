@@ -1,0 +1,56 @@
+{
+  "$schema": "https://www.schemastore.org/package.json",
+  "name": "route-bundle-size",
+  "version": "0.1.0",
+  "description": "Per-route bundle size budget for Next.js builds: measure compressed sizes, diff against a baseline, exit 1 on regression.",
+  "keywords": [
+    "nextjs",
+    "turbopack",
+    "bundle-size",
+    "performance-budget",
+    "ci",
+    "cli"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bra31k/route-bundle-size.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bra31k/route-bundle-size/issues"
+  },
+  "homepage": "https://github.com/bra31k/route-bundle-size#readme",
+  "type": "module",
+  "bin": {
+    "route-bundle-size": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
+    "types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "cli-table3": "^0.6.5",
+    "commander": "^15.0.0",
+    "markdown-table": "^3.0.4",
+    "picomatch": "^4.0.4",
+    "pretty-bytes": "^7.1.0"
+  },
+  "devDependencies": {
+    "@jest/globals": "^30.4.1",
+    "@types/node": "^25.6.0",
+    "@types/picomatch": "^4.0.3",
+    "jest": "^30.4.2",
+    "jest-environment-node": "^30.4.1",
+    "ts-jest": "^29.4.6",
+    "tsx": "^4.9.1",
+    "typescript": "^6.0.3"
+  }
+}
