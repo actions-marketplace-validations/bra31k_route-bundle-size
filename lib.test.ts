@@ -9,8 +9,10 @@ import {
   assertComparable,
   buildRows,
   buildSummary,
+  findUnmatchedOverrides,
+  formatBytes,
   formatDelta,
-  hasCompressedData,
+  formatFailure,
   isExcluded,
   isNotableShrink,
   loadSizes,
@@ -24,30 +26,41 @@ import type { SnapshotRoute } from "./src/stats";
 
 const APP_EXCLUDE = [
   "/api/**",
-  "/auth/**",
-  "/debug/**",
-  "/embed/redirect/**",
-  "/admin",
-  "/admin/**",
+  "/preview/**",
+  "/test/**",
+  "/docs/legacy/**",
+  "/account",
+  "/account/**",
 ];
 
 const rawBudget: Budget = {
   metric: "raw",
   maxIncrease: 51_200,
   maxIncreasePercent: 10,
+  maxSize: null,
+  overrides: [],
 };
 
 const compressedBudget: Budget = {
   metric: "compressed",
   maxIncrease: 30 * 1024,
   maxIncreasePercent: 10,
+  maxSize: null,
+  overrides: [],
 };
 
 const zeroBudget: Budget = {
   metric: "raw",
   maxIncrease: 0,
   maxIncreasePercent: 0,
+  maxSize: null,
+  overrides: [],
 };
+
+const withBudget = (changes: Partial<Budget>): Budget => ({
+  ...rawBudget,
+  ...changes,
+});
 
 const sizes = (
   entries: Array<[string, number, number?, (number | null)?]>,
@@ -65,7 +78,7 @@ afterAll(() => written.forEach((file) => fs.unlinkSync(file)));
 const tmpFile = (contents: unknown): string => {
   const file = path.join(
     os.tmpdir(),
-    `bundle-size-lib-${process.pid}-${Math.random()}.json`,
+    `route-bundle-size-lib-${process.pid}-${Math.random()}.json`,
   );
   fs.writeFileSync(file, JSON.stringify(contents));
   written.push(file);
@@ -95,22 +108,24 @@ const row = (overrides: Partial<Row>): Row => ({
   delta: 0,
   deltaPercent: 0,
   chunkDelta: 0,
+  limits: { maxIncrease: 51_200, maxIncreasePercent: 10, maxSize: null },
   exceeded: false,
+  overMaxSize: false,
   ...overrides,
 });
 
 describe("isExcluded", () => {
-  it("matches every pattern — nested, dynamic and dot segments included", () => {
+  it("matches every pattern, including nested, dynamic and dot segments", () => {
     expect(isExcluded("/api/foo", APP_EXCLUDE)).toBe(true);
-    expect(isExcluded("/auth/login", APP_EXCLUDE)).toBe(true);
-    expect(isExcluded("/debug/widget", APP_EXCLUDE)).toBe(true);
-    expect(isExcluded("/embed/redirect/x", APP_EXCLUDE)).toBe(true);
-    expect(isExcluded("/admin/anything", APP_EXCLUDE)).toBe(true);
+    expect(isExcluded("/preview/post", APP_EXCLUDE)).toBe(true);
+    expect(isExcluded("/test/widget", APP_EXCLUDE)).toBe(true);
+    expect(isExcluded("/docs/legacy/x", APP_EXCLUDE)).toBe(true);
+    expect(isExcluded("/account/anything", APP_EXCLUDE)).toBe(true);
     expect(isExcluded("/api/foo/bar/baz", APP_EXCLUDE)).toBe(true);
     expect(isExcluded("/api/[...slug]", APP_EXCLUDE)).toBe(true);
     // Route paths are URLs, not files: a leading dot is an ordinary segment.
     expect(isExcluded("/api/.well-known", APP_EXCLUDE)).toBe(true);
-    expect(isExcluded("/debug/.hidden/x", APP_EXCLUDE)).toBe(true);
+    expect(isExcluded("/test/.hidden/x", APP_EXCLUDE)).toBe(true);
     expect(isExcluded("/api/v1.2/x", APP_EXCLUDE)).toBe(true);
   });
 
@@ -118,30 +133,40 @@ describe("isExcluded", () => {
     expect(isExcluded("/", APP_EXCLUDE)).toBe(false);
     expect(isExcluded("/project/123", APP_EXCLUDE)).toBe(false);
     expect(isExcluded("/projects/[id]", APP_EXCLUDE)).toBe(false);
-    // /embed/ alone is NOT excluded — only /embed/redirect/.
-    expect(isExcluded("/embed", APP_EXCLUDE)).toBe(false);
-    expect(isExcluded("/embed/onboarding", APP_EXCLUDE)).toBe(false);
-    expect(isExcluded("/embed/webapp", APP_EXCLUDE)).toBe(false);
+    // /docs alone is NOT excluded, only /docs/legacy/.
+    expect(isExcluded("/docs", APP_EXCLUDE)).toBe(false);
+    expect(isExcluded("/docs/intro", APP_EXCLUDE)).toBe(false);
+    expect(isExcluded("/docs/guide", APP_EXCLUDE)).toBe(false);
     // The empty list is the default: it must exclude nothing at all.
     expect(isExcluded("/api/foo", [])).toBe(false);
   });
 
-  it("does not leak past segment boundaries the way prefix matching did", () => {
-    // These patterns replaced `route.startsWith(prefix)`. A lookalike sibling
-    // must not be swept in: startsWith("/admin") also matched
-    // "/administrator", which was never intended.
+  it("does not match a lookalike route that only shares a prefix", () => {
     expect(isExcluded("/apiary", APP_EXCLUDE)).toBe(false);
     expect(isExcluded("/api-docs", APP_EXCLUDE)).toBe(false);
-    expect(isExcluded("/authenticate", APP_EXCLUDE)).toBe(false);
-    expect(isExcluded("/debugger", APP_EXCLUDE)).toBe(false);
-    expect(isExcluded("/administrator", APP_EXCLUDE)).toBe(false);
+    expect(isExcluded("/previews", APP_EXCLUDE)).toBe(false);
+    expect(isExcluded("/testimonials", APP_EXCLUDE)).toBe(false);
+    expect(isExcluded("/accounting", APP_EXCLUDE)).toBe(false);
   });
 
   it("treats a `/x/**` pattern as also covering the container route itself", () => {
     expect(isExcluded("/api", APP_EXCLUDE)).toBe(true);
-    expect(isExcluded("/debug", APP_EXCLUDE)).toBe(true);
-    expect(isExcluded("/embed/redirect", APP_EXCLUDE)).toBe(true);
-    expect(isExcluded("/admin", APP_EXCLUDE)).toBe(true);
+    expect(isExcluded("/test", APP_EXCLUDE)).toBe(true);
+    expect(isExcluded("/docs/legacy", APP_EXCLUDE)).toBe(true);
+    expect(isExcluded("/account", APP_EXCLUDE)).toBe(true);
+  });
+
+  it("a bracketed segment in a pattern matches only the dynamic route", () => {
+    expect(isExcluded("/blog/[slug]", ["/blog/[slug]"])).toBe(true);
+    expect(isExcluded("/blog/s", ["/blog/[slug]"])).toBe(false);
+    expect(isExcluded("/blog/g", ["/blog/[slug]"])).toBe(false);
+  });
+
+  it("a catch-all route pattern matches itself", () => {
+    expect(isExcluded("/docs/[[...path]]", ["/docs/[[...path]]"])).toBe(true);
+    expect(isExcluded("/shop/[...all]", ["/shop/[...all]"])).toBe(true);
+    expect(isExcluded("/[locale]/settings", ["/[locale]/**"])).toBe(true);
+    expect(isExcluded("/e/settings", ["/[locale]/**"])).toBe(false);
   });
 });
 
@@ -159,14 +184,14 @@ describe("loadSizes", () => {
     const loaded = loadSizes(rawStatsFile, []);
     expect([...loaded.sizes.keys()].sort()).toEqual(["/", "/api/foo"]);
     expect(loaded.sizes.get("/")?.chunks).toBe(3);
-    expect(hasCompressedData(loaded)).toBe(false);
+    expect(loaded.compressed).toBe(false);
     expect(loaded.sizes.get("/")?.compressedBytes).toBeNull();
     expect([...loadSizes(rawStatsFile, APP_EXCLUDE).sizes.keys()]).toEqual([
       "/",
     ]);
   });
 
-  it("reads a snapshot with compressed bytes, honouring excludes", () => {
+  it("reads a snapshot with compressed bytes and applies excludes", () => {
     const file = writeSnapshotFixture([
       {
         route: "/",
@@ -182,7 +207,7 @@ describe("loadSizes", () => {
       },
     ]);
     const loaded = loadSizes(file, APP_EXCLUDE);
-    expect(hasCompressedData(loaded)).toBe(true);
+    expect(loaded.compressed).toBe(true);
     expect([...loaded.sizes.keys()]).toEqual(["/"]);
     const root = loaded.sizes.get("/");
     expect(root).toEqual({ bytes: 1000, chunks: 2, compressedBytes: 400 });
@@ -356,8 +381,240 @@ describe("buildRows", () => {
   });
 });
 
+describe("budget limits", () => {
+  it("uses the first matching override for a route", () => {
+    const budget = withBudget({
+      overrides: [
+        { match: "/blog/**", maxIncrease: 100_000, maxIncreasePercent: 100 },
+        { match: "/blog/*", maxIncrease: 0, maxIncreasePercent: 0 },
+      ],
+    });
+    const { rows, anyExceeded } = buildRows(
+      sizes([["/blog/post", 1_500]]),
+      sizes([["/blog/post", 1_000]]),
+      budget,
+    );
+
+    expect(anyExceeded).toBe(false);
+    expect(rows[0]?.limits).toEqual({
+      maxIncrease: 100_000,
+      maxIncreasePercent: 100,
+      maxSize: null,
+    });
+  });
+
+  it("merges an override over the global budget key by key", () => {
+    const budget = withBudget({
+      maxSize: 2_000_000,
+      overrides: [{ match: "/a", maxIncreasePercent: 50 }],
+    });
+    const { rows } = buildRows(sizes([["/a", 1_000]]), sizes([]), budget);
+
+    expect(rows[0]?.limits).toEqual({
+      maxIncrease: 51_200,
+      maxIncreasePercent: 50,
+      maxSize: 2_000_000,
+    });
+  });
+
+  it("keeps the global budget for a route that matches no override", () => {
+    const budget = withBudget({
+      overrides: [{ match: "/blog/**", maxIncreasePercent: 100 }],
+    });
+    const { rows, anyExceeded } = buildRows(
+      sizes([["/pricing", 1_500]]),
+      sizes([["/pricing", 1_000]]),
+      budget,
+    );
+
+    expect(anyExceeded).toBe(true);
+    expect(rows[0]?.limits).toEqual({
+      maxIncrease: 51_200,
+      maxIncreasePercent: 10,
+      maxSize: null,
+    });
+  });
+
+  it("matches a dynamic route written as /blog/[slug]", () => {
+    const budget = withBudget({
+      overrides: [{ match: "/blog/[slug]", maxIncreasePercent: 100 }],
+    });
+    const { anyExceeded } = buildRows(
+      sizes([["/blog/[slug]", 1_500]]),
+      sizes([["/blog/[slug]", 1_000]]),
+      budget,
+    );
+
+    expect(anyExceeded).toBe(false);
+  });
+
+  it("does not apply a /blog/[slug] override to a static /blog/s route", () => {
+    const budget = withBudget({
+      overrides: [{ match: "/blog/[slug]", maxIncreasePercent: 100 }],
+    });
+    const { anyExceeded } = buildRows(
+      sizes([["/blog/s", 1_500]]),
+      sizes([["/blog/s", 1_000]]),
+      budget,
+    );
+
+    expect(anyExceeded).toBe(true);
+  });
+
+  it("flags a route above maxSize even when it did not grow", () => {
+    const { rows, anyExceeded } = buildRows(
+      sizes([["/", 1_000_000]]),
+      sizes([["/", 1_000_000]]),
+      withBudget({ maxSize: 900_000 }),
+    );
+
+    expect(anyExceeded).toBe(true);
+    expect(rows[0]?.exceeded).toBe(false);
+    expect(rows[0]?.overMaxSize).toBe(true);
+  });
+
+  it("does not flag a route exactly at maxSize", () => {
+    const { anyExceeded } = buildRows(
+      sizes([["/", 1_000_000]]),
+      sizes([["/", 1_000_000]]),
+      withBudget({ maxSize: 1_000_000 }),
+    );
+
+    expect(anyExceeded).toBe(false);
+  });
+
+  it("flags a new route above maxSize", () => {
+    const { rows, anyExceeded } = buildRows(
+      sizes([["/added", 1_000_000]]),
+      sizes([]),
+      withBudget({ maxSize: 900_000 }),
+    );
+
+    expect(anyExceeded).toBe(true);
+    expect(rows[0]?.overMaxSize).toBe(true);
+  });
+
+  it("never flags a removed route for maxSize", () => {
+    const { rows, anyExceeded } = buildRows(
+      sizes([]),
+      sizes([["/gone", 1_000_000]]),
+      withBudget({ maxSize: 0 }),
+    );
+
+    expect(anyExceeded).toBe(false);
+    expect(rows[0]?.overMaxSize).toBe(false);
+  });
+
+  it("sorts failing rows first, then by absolute delta", () => {
+    const { rows } = buildRows(
+      sizes([
+        ["/big-drop", 100_000],
+        ["/capped", 600_000],
+        ["/grown", 1_100],
+        ["/small-drop", 900_000],
+      ]),
+      sizes([
+        ["/big-drop", 900_000],
+        ["/capped", 600_000],
+        ["/grown", 1_000],
+        ["/small-drop", 1_000_000],
+      ]),
+      withBudget({ overrides: [{ match: "/capped", maxSize: 500_000 }] }),
+    );
+
+    expect(rows.map((r) => r.route)).toEqual([
+      "/grown",
+      "/capped",
+      "/big-drop",
+      "/small-drop",
+    ]);
+  });
+
+  it("marks a notable shrink using the route's own limits", () => {
+    const { rows } = buildRows(
+      sizes([
+        ["/a", 98_000],
+        ["/b", 98_000],
+      ]),
+      sizes([
+        ["/a", 100_000],
+        ["/b", 100_000],
+      ]),
+      withBudget({ overrides: [{ match: "/a", maxIncrease: 1_000 }] }),
+    );
+    const byRoute = new Map(rows.map((r) => [r.route, r]));
+
+    expect(formatDelta(byRoute.get("/a")!)).toMatch(/🟢/);
+    expect(formatDelta(byRoute.get("/b")!)).not.toMatch(/🟢/);
+  });
+
+  it("reports overrides that match no route", () => {
+    const { rows } = buildRows(
+      sizes([["/dashboard", 1_000]]),
+      sizes([["/old", 1_000]]),
+      rawBudget,
+    );
+
+    expect(
+      findUnmatchedOverrides(rows, [
+        { match: "/dashbord" },
+        { match: "/dashboard" },
+        { match: "/old" },
+      ]),
+    ).toEqual(["/dashbord"]);
+  });
+});
+
+describe("formatFailure", () => {
+  const KiB = 1024;
+
+  it("failure message names each route with the limit it broke", () => {
+    const budget: Budget = {
+      ...compressedBudget,
+      overrides: [{ match: "/editor", maxSize: 450 * KiB }],
+    };
+    const { rows } = buildRows(
+      sizes([
+        ["/dashboard", 0, 0, 290 * KiB],
+        ["/editor", 0, 0, 460 * KiB],
+      ]),
+      sizes([
+        ["/dashboard", 0, 0, 250 * KiB],
+        ["/editor", 0, 0, 460 * KiB],
+      ]),
+      budget,
+    );
+
+    expect(formatFailure(rows)).toBe(
+      "Bundle size budget exceeded for 2 route(s): /dashboard (limit +30 KiB or +10%), /editor (max size 450 KiB)",
+    );
+
+    const both = buildRows(
+      sizes([["/editor", 0, 0, 460 * KiB]]),
+      sizes([["/editor", 0, 0, 400 * KiB]]),
+      budget,
+    );
+
+    expect(formatFailure(both.rows)).toBe(
+      "Bundle size budget exceeded for 1 route(s): /editor (limit +30 KiB or +10%, max size 450 KiB)",
+    );
+  });
+
+  it("failure message lists the first five routes and counts the rest", () => {
+    const { rows } = buildRows(
+      sizes([1, 2, 3, 4, 5, 6, 7].map((n) => [`/r${n}`, n * 1_000])),
+      sizes([]),
+      withBudget({ maxSize: 0 }),
+    );
+
+    expect(formatFailure(rows)).toBe(
+      "Bundle size budget exceeded for 7 route(s): /r7 (max size 0 B), /r6 (max size 0 B), /r5 (max size 0 B), /r4 (max size 0 B), /r3 (max size 0 B) (and 2 more)",
+    );
+  });
+});
+
 describe("buildSummary", () => {
-  it("aggregates totals and per-route averages", () => {
+  it("computes per-route averages", () => {
     const { rows } = buildRows(
       sizes([
         ["/a", 100, 2],
@@ -370,13 +627,8 @@ describe("buildSummary", () => {
       rawBudget,
     );
     expect(buildSummary(rows, "raw")).toMatchObject({
-      totalCurrent: 300,
-      totalBaseline: 300,
-      totalDelta: 0,
       avgCurrent: 150,
       avgBaseline: 150,
-      chunksCurrent: 5,
-      chunksBaseline: 5,
     });
   });
 
@@ -393,45 +645,44 @@ describe("buildSummary", () => {
     });
   });
 
-  it("returns null totalDeltaPercent when baseline is empty", () => {
-    const { rows } = buildRows(sizes([["/new", 100]]), sizes([]), rawBudget);
-    expect(buildSummary(rows, "raw").totalDeltaPercent).toBeNull();
-  });
-
-  it("totals compressed bytes under the compressed metric", () => {
+  it("averages compressed bytes under the compressed metric", () => {
     const { rows } = buildRows(
       sizes([["/a", 2_000, 1, 900]]),
       sizes([["/a", 2_000, 1, 700]]), // raw identical: only compressed counts
       compressedBudget,
     );
     expect(buildSummary(rows, "compressed")).toMatchObject({
-      totalCurrent: 900,
-      totalBaseline: 700,
-      totalDelta: 200,
+      avgCurrent: 900,
+      avgBaseline: 700,
     });
   });
 });
 
 describe("formatDelta", () => {
   it("returns em-dash for sub-threshold deltas (incl. zero)", () => {
-    expect(formatDelta(row({ delta: 0 }), rawBudget)).toBe("—");
-    expect(formatDelta(row({ delta: 200 }), rawBudget)).toBe("—");
-    expect(formatDelta(row({ delta: -200 }), rawBudget)).toBe("—");
+    expect(formatDelta(row({ delta: 0 }))).toBe("—");
+    expect(formatDelta(row({ delta: 200 }))).toBe("—");
+    expect(formatDelta(row({ delta: -200 }))).toBe("—");
+  });
+
+  it("keeps the delta visible for an exceeded row under 250 bytes", () => {
+    const exceeded = row({ delta: 200, deltaPercent: 20, exceeded: true });
+    expect(formatDelta(exceeded)).toBe("+200 B (+20.0%) 🔴");
   });
 
   it("marks exceeded growth with 🔴 and notable shrink with 🟢", () => {
     const exceeded = row({ delta: 60_000, deltaPercent: 6, exceeded: true });
     const shrunk = row({ delta: -60_000, deltaPercent: -6 });
-    expect(formatDelta(exceeded, rawBudget)).toMatch(/\+60 kB.*🔴/);
-    expect(formatDelta(shrunk, rawBudget)).toMatch(/-60 kB.*🟢/);
+    expect(formatDelta(exceeded)).toMatch(/\+58\.6 KiB.*🔴/);
+    expect(formatDelta(shrunk)).toMatch(/-58\.6 KiB.*🟢/);
   });
 
   it("labels new routes '(new)' and drops the percent for removed routes", () => {
     // Size column already says "(removed)"; -100% on the delta is noise.
     const gone = row({ current: null, delta: -1_000_000, deltaPercent: -100 });
     const added = row({ baseline: null, delta: 1_000_000, deltaPercent: null });
-    expect(formatDelta(gone, rawBudget)).not.toMatch(/-100|%/);
-    expect(formatDelta(added, rawBudget)).toMatch(/\(new\)/);
+    expect(formatDelta(gone)).not.toMatch(/-100|%|🟢/);
+    expect(formatDelta(added)).toMatch(/\(new\)/);
   });
 });
 
@@ -440,15 +691,16 @@ describe("isNotableShrink", () => {
     const abs = row({ delta: -52_000, deltaPercent: -5 });
     const percent = row({ delta: -1_000, deltaPercent: -11 });
     const neither = row({ delta: -1_000, deltaPercent: -5 });
-    expect(isNotableShrink(abs, rawBudget)).toBe(true);
-    expect(isNotableShrink(percent, rawBudget)).toBe(true);
-    expect(isNotableShrink(neither, rawBudget)).toBe(false);
+    expect(isNotableShrink(abs)).toBe(true);
+    expect(isNotableShrink(percent)).toBe(true);
+    expect(isNotableShrink(neither)).toBe(false);
   });
 
   it("never trips on growth, nor on an unchanged route under a zero budget", () => {
     const grown = row({ delta: 60_000, deltaPercent: 6 });
-    expect(isNotableShrink(grown, rawBudget)).toBe(false);
-    expect(isNotableShrink(row({ delta: 0 }), zeroBudget)).toBe(false);
+    expect(isNotableShrink(grown)).toBe(false);
+    const zeroLimits = { maxIncrease: 0, maxIncreasePercent: 0, maxSize: null };
+    expect(isNotableShrink(row({ delta: 0, limits: zeroLimits }))).toBe(false);
   });
 });
 
@@ -461,25 +713,43 @@ describe("renderers (smoke)", () => {
   const summary = buildSummary(rows, "compressed");
 
   it("renderBootstrap emits a 'baseline pending' message", () => {
-    const out = renderBootstrap(sizes([["/", 1_000_000]]));
+    const bootstrap = buildRows(
+      sizes([["/", 1_000_000]]),
+      new Map(),
+      rawBudget,
+    );
+    const out = renderBootstrap(bootstrap.rows, "raw");
     expect(out).toMatch(/Baseline not yet established/);
-    expect(out).toMatch(/1 routes captured/);
+    expect(out).toMatch(/1 route\(s\) captured\. Sizes are raw\./);
+    expect(out).toMatch(/\| 977 KiB +\|/);
   });
 
   it("renderMarkdown emits a pipe-delimited table, summary block and legend", () => {
     const out = renderMarkdown(rows, summary, compressedBudget);
-    expect(out).toMatch(/## 📦 Bundle size/);
+    expect(out).toMatch(/## Bundle size/);
     expect(out).toMatch(/\| `\/` +\|/);
-    expect(out).toMatch(/\| 400 kB +\| \+100 kB \(\+33\.3%\) 🔴 \|/);
+    expect(out).toMatch(/\| 391 KiB +\| \+97\.7 KiB \(\+33\.3%\) 🔴 \|/);
     expect(out).toMatch(/### Summary/);
-    expect(out).toMatch(/🔴 exceeds `\+30.7 kB` OR `\+10%` compressed/);
+    expect(out).toContain(
+      "🔴 grew by at least 30 KiB or 10% (compressed) · 🟢 notable improvement",
+    );
   });
 
-  it("renderTerminal emits a cli-table3 box with a TOTAL row", () => {
+  it("renderTerminal emits a cli-table3 box", () => {
     const out = renderTerminal(rows, summary, compressedBudget);
-    // Box-drawing chars are the load-bearing terminal signal.
+    // Box-drawing chars show that the terminal format was used.
     expect(out).toMatch(/[┌┐└┘│─]/);
-    expect(out).toMatch(/TOTAL/);
+  });
+
+  it("prints no total row and no chunk summary", () => {
+    const terminal = renderTerminal(rows, summary, compressedBudget);
+    const markdown = renderMarkdown(rows, summary, compressedBudget);
+    expect(terminal).not.toMatch(/TOTAL/);
+    expect(terminal).toContain("Avg per route: 293 KiB → 391 KiB");
+    expect(markdown).not.toMatch(/\*\*Total:\*\*/);
+    expect(markdown).not.toMatch(/\*\*Chunks:\*\*/);
+    expect(markdown).toMatch(/\*\*Routes:\*\* 1/);
+    expect(markdown).toMatch(/\*\*Avg per route:\*\* 293 KiB → 391 KiB/);
   });
 
   it("renders raw byte cells and an unqualified legend under the raw budget", () => {
@@ -491,10 +761,66 @@ describe("renderers (smoke)", () => {
     const rawSummary = buildSummary(raw.rows, "raw");
 
     const markdown = renderMarkdown(raw.rows, rawSummary, rawBudget);
-    expect(markdown).toMatch(/\| 1\.5 MB +\| \+500 kB \(\+50\.0%\) 🔴 \|/);
-    expect(markdown).toMatch(/🔴 exceeds `\+51\.2 kB` OR `\+10%`/);
+    expect(markdown).toMatch(/\| 1\.43 MiB +\| \+488 KiB \(\+50\.0%\) 🔴 \|/);
+    expect(markdown).toContain(
+      "🔴 grew by at least 50 KiB or 10% · 🟢 notable improvement",
+    );
     expect(markdown).not.toMatch(/compressed/);
 
-    expect(renderTerminal(raw.rows, rawSummary, rawBudget)).toMatch(/1\.5 MB/);
+    expect(renderTerminal(raw.rows, rawSummary, rawBudget)).toMatch(
+      /1\.43 MiB/,
+    );
+  });
+
+  it("prints sizes in 1024 based units", () => {
+    expect(formatBytes(30 * 1024)).toBe("30 KiB");
+    expect(formatBytes(500_000)).toBe("488 KiB");
+    expect(formatBytes(1_500_000)).toBe("1.43 MiB");
+  });
+
+  it("puts the red mark on the size cell for a route above maxSize", () => {
+    const capped = buildRows(
+      sizes([["/", 1_000_000]]),
+      sizes([["/", 1_000_000]]),
+      withBudget({ maxSize: 900_000 }),
+    );
+    const cappedSummary = buildSummary(capped.rows, "raw");
+
+    expect(renderMarkdown(capped.rows, cappedSummary, rawBudget)).toMatch(
+      /\| 977 KiB 🔴 +\| — +\|/,
+    );
+    expect(renderTerminal(capped.rows, cappedSummary, rawBudget)).toMatch(
+      /977 KiB 🔴 +│ +— +│/,
+    );
+  });
+
+  it("legend names maxSize when it is set", () => {
+    const budget = { ...compressedBudget, maxSize: 300 * 1024 };
+
+    expect(renderMarkdown(rows, summary, budget)).toContain(
+      "🔴 grew by at least 30 KiB or 10%, or is larger than 300 KiB (compressed) · 🟢 notable improvement",
+    );
+    expect(renderTerminal(rows, summary, budget)).toContain(
+      "🔴 grew by at least 30 KiB or 10%, or is larger than 300 KiB (compressed)   🟢 notable improvement   1 route(s)",
+    );
+  });
+
+  it("legend says some routes have their own limits when overrides exist", () => {
+    const overrides = [{ match: "/blog/**", maxIncreasePercent: 20 }];
+
+    expect(
+      renderMarkdown(rows, summary, {
+        ...compressedBudget,
+        maxSize: 300 * 1024,
+        overrides,
+      }),
+    ).toContain(
+      "🔴 grew by at least 30 KiB or 10%, or is larger than 300 KiB (compressed; some routes have their own limits)",
+    );
+    expect(
+      renderMarkdown(rows, summary, { ...compressedBudget, overrides }),
+    ).toContain(
+      "🔴 grew by at least 30 KiB or 10% (compressed; some routes have their own limits)",
+    );
   });
 });

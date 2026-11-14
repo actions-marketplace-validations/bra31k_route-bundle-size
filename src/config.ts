@@ -6,10 +6,17 @@ export const CONFIG_FILE_NAME = "route-bundle-size.config.json";
 export const METRICS = ["raw", "compressed"] as const;
 export type Metric = (typeof METRICS)[number];
 
-export type Budget = {
-  metric: Metric;
+export type Limits = {
   maxIncrease: number;
   maxIncreasePercent: number;
+  maxSize: number | null;
+};
+
+export type Override = Partial<Limits> & { match: string };
+
+export type Budget = Limits & {
+  metric: Metric;
+  overrides: Override[];
 };
 
 export type Config = {
@@ -23,11 +30,19 @@ export const DEFAULT_CONFIG: Config = {
     metric: "compressed",
     maxIncrease: 30 * 1024,
     maxIncreasePercent: 10,
+    maxSize: null,
+    overrides: [],
   },
 };
 
-const BYTE_UNITS: Record<string, number> = { b: 1, kb: 1024, mb: 1024 * 1024 };
-const BYTE_SIZE_PATTERN = /^\s*(\d+(?:\.\d+)?)\s*(b|kb|mb)?\s*$/i;
+const BYTE_UNITS: Record<string, number> = {
+  b: 1,
+  kb: 1024,
+  kib: 1024,
+  mb: 1024 * 1024,
+  mib: 1024 * 1024,
+};
+const BYTE_SIZE_PATTERN = /^\s*(\d+(?:\.\d+)?)\s*(b|kb|kib|mb|mib)?\s*$/i;
 
 export const parseByteSize = (value: unknown, field: string): number => {
   const numeric = typeof value === "number" ? value : Number.NaN;
@@ -66,12 +81,64 @@ const assertKnownKeys = (value: object, validKeys: string[], where: string) => {
   }
 };
 
+const parsePercent = (value: unknown, field: string): number => {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(
+      `Invalid ${field}: ${JSON.stringify(value)}. Expected a non-negative number.`,
+    );
+  }
+
+  return value;
+};
+
+const OVERRIDE_KEYS = ["match", "maxIncrease", "maxIncreasePercent", "maxSize"];
+
+const parseOverride = (
+  value: unknown,
+  index: number,
+  source: string,
+): Override => {
+  const label = (key: string) =>
+    `"budget.overrides[${index}]${key}" in ${source}`;
+  const raw = asObject(value, label(""));
+  assertKnownKeys(raw, OVERRIDE_KEYS, label(""));
+
+  if (typeof raw.match !== "string" || raw.match === "") {
+    throw new Error(
+      `Invalid ${label(".match")}: ${JSON.stringify(raw.match)}. Expected a glob pattern.`,
+    );
+  }
+
+  const override: Override = { match: raw.match };
+
+  if (raw.maxIncrease !== undefined) {
+    override.maxIncrease = parseByteSize(
+      raw.maxIncrease,
+      label(".maxIncrease"),
+    );
+  }
+
+  if (raw.maxIncreasePercent !== undefined) {
+    override.maxIncreasePercent = parsePercent(
+      raw.maxIncreasePercent,
+      label(".maxIncreasePercent"),
+    );
+  }
+
+  if (raw.maxSize !== undefined) {
+    override.maxSize = parseByteSize(raw.maxSize, label(".maxSize"));
+  }
+
+  return override;
+};
+
 export const parseConfig = (value: unknown, source: string): Config => {
   const raw = asObject(value, `config in ${source}`);
   assertKnownKeys(raw, Object.keys(DEFAULT_CONFIG), source);
 
   const { exclude, budget: budgetValue }: Record<string, unknown> = {
     ...DEFAULT_CONFIG,
+    budget: {},
     ...raw,
   };
 
@@ -91,7 +158,8 @@ export const parseConfig = (value: unknown, source: string): Config => {
   const {
     metric: metricValue,
     maxIncrease: maxIncreaseValue,
-    maxIncreasePercent,
+    maxIncreasePercent: maxIncreasePercentValue,
+    overrides: overridesValue,
   }: Record<string, unknown> = { ...DEFAULT_CONFIG.budget, ...budgetRaw };
 
   const metric = METRICS.find((known) => known === metricValue);
@@ -102,22 +170,35 @@ export const parseConfig = (value: unknown, source: string): Config => {
     );
   }
 
-  if (
-    typeof maxIncreasePercent !== "number" ||
-    !Number.isFinite(maxIncreasePercent) ||
-    maxIncreasePercent < 0
-  ) {
-    throw new Error(
-      `Invalid "budget.maxIncreasePercent" in ${source}: ${JSON.stringify(maxIncreasePercent)}. Expected a non-negative number.`,
-    );
-  }
+  const maxIncreasePercent = parsePercent(
+    maxIncreasePercentValue,
+    `"budget.maxIncreasePercent" in ${source}`,
+  );
 
   const maxIncrease = parseByteSize(
     maxIncreaseValue,
     `"budget.maxIncrease" in ${source}`,
   );
 
-  return { exclude, budget: { metric, maxIncrease, maxIncreasePercent } };
+  const maxSize =
+    budgetRaw.maxSize === undefined
+      ? null
+      : parseByteSize(budgetRaw.maxSize, `"budget.maxSize" in ${source}`);
+
+  if (!Array.isArray(overridesValue)) {
+    throw new Error(
+      `Invalid "budget.overrides" in ${source}: expected an array of objects.`,
+    );
+  }
+
+  const overrides = overridesValue.map((override, index) =>
+    parseOverride(override, index, source),
+  );
+
+  return {
+    exclude,
+    budget: { metric, maxIncrease, maxIncreasePercent, maxSize, overrides },
+  };
 };
 
 export const loadConfig = (options: {

@@ -26,7 +26,9 @@ const makeAppDir = (
   entries: RawEntry[],
   options: { writeChunks?: boolean; writeStats?: boolean } = {},
 ): { appDir: string; statsFile: string } => {
-  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), "bundle-size-measure-"));
+  const appDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "route-bundle-size-measure-"),
+  );
   created.push(appDir);
 
   const chunkDir = path.join(appDir, ".next", "static", "chunks");
@@ -149,8 +151,12 @@ describe("measure", () => {
   it("explains how to produce the stats file when it is absent", () => {
     const { appDir, statsFile } = makeAppDir(twoRoutes, { writeStats: false });
 
+    expect(() => measure({ appDir, statsFile })).toThrow(/--app-dir/);
     expect(() => measure({ appDir, statsFile })).toThrow(
-      /A Turbopack production build on Next\.js >= 16\.2 writes this file\./,
+      /next build --webpack/,
+    );
+    expect(() => measure({ appDir, statsFile })).toThrow(
+      /--stats <app-dir>\/<distDir>\/diagnostics\/route-bundle-stats\.json/,
     );
   });
 
@@ -165,6 +171,29 @@ describe("measure", () => {
     );
 
     expect(() => measure({ appDir, statsFile })).toThrow(/entry 1/);
+    expect(() => measure({ appDir, statsFile })).toThrow(statsFile);
+  });
+
+  it("measure rejects firstLoadChunkPaths that is not an array of strings", () => {
+    const { appDir, statsFile } = makeAppDir([]);
+    fs.writeFileSync(
+      statsFile,
+      JSON.stringify([
+        {
+          route: "/",
+          firstLoadUncompressedJsBytes: 0,
+          firstLoadChunkPaths: null,
+        },
+        {
+          route: "/a",
+          firstLoadUncompressedJsBytes: 1,
+          firstLoadChunkPaths: "a.js",
+        },
+      ]),
+    );
+
+    expect(() => measure({ appDir, statsFile })).toThrow(/entry 1/);
+    expect(() => measure({ appDir, statsFile })).toThrow(/firstLoadChunkPaths/);
     expect(() => measure({ appDir, statsFile })).toThrow(statsFile);
   });
 

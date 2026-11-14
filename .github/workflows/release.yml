@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Ensure npm supports trusted publishing
+        run: |
+          minimum="11.5.1"
+          current="$(npm --version)"
+          if [ "$(printf '%s\n%s\n' "$minimum" "$current" | sort -V | head -n 1)" != "$minimum" ]; then
+            npm install --global "npm@^$minimum"
+          fi
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Check release tag matches package version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "::error::Release tag '$RELEASE_TAG' does not match package.json version 'v$version'."
+            exit 1
+          fi
+          echo "major=v${version%%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm
+        run: npm publish
+
+      - name: Move major tag to release commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MAJOR_TAG: ${{ steps.version.outputs.major }}
+        run: |
+          git tag --force "$MAJOR_TAG" "$GITHUB_SHA"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$MAJOR_TAG"

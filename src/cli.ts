@@ -1,19 +1,25 @@
 #!/usr/bin/env node
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 
 import { Command, Option } from "commander";
 
-import { loadConfig } from "./config.js";
+import { type Budget, loadConfig } from "./config.js";
 import {
   assertComparable,
+  assertMaxSizeComparable,
   buildRows,
   buildSummary,
+  findUnmatchedOverrides,
   FORMATS,
   type Format,
+  formatFailure,
+  type LoadedSizes,
   loadSizes,
   renderBootstrap,
   renderMarkdown,
   renderTerminal,
+  type Row,
 } from "./lib.js";
 import { defaultStatsFile, measure, writeSnapshot } from "./measure.js";
 
@@ -28,33 +34,76 @@ const writeSummary = (markdown: string): void => {
   console.log(markdown);
 };
 
+const formatMessage = (
+  level: "error" | "warning",
+  message: string,
+): string => {
+  if (process.env.GITHUB_ACTIONS === "true") {
+    return `::${level}::${message}`;
+  }
+
+  return level === "warning" ? `Warning: ${message}` : message;
+};
+
+const loadInput = (filePath: string, exclude: string[]): LoadedSizes => {
+  const loaded = loadSizes(filePath, exclude);
+
+  if (loaded.sizes.size === 0) {
+    console.error(
+      formatMessage(
+        "warning",
+        `No routes to check in ${filePath}. The file lists no routes, or "exclude" removes all of them.`,
+      ),
+    );
+  }
+
+  return loaded;
+};
+
+const reportVerdict = (
+  rows: Row[],
+  anyExceeded: boolean,
+  budget: Budget,
+): void => {
+  for (const match of findUnmatchedOverrides(rows, budget.overrides)) {
+    console.error(
+      formatMessage("warning", `Override "${match}" matches no route.`),
+    );
+  }
+
+  if (anyExceeded) {
+    console.error(formatMessage("error", formatFailure(rows)));
+    process.exitCode = 1;
+  }
+};
+
 const diffCommand = new Command("diff")
   .description(
-    "Diff route bundle sizes against a baseline; render markdown or terminal table; exit 1 on exceeded.",
+    "Compare route bundle sizes with a baseline and report the routes that grew past the budget.",
   )
   .requiredOption(
     "--current <file>",
-    "Path to the PR's snapshot or route-bundle-stats.json",
+    "Snapshot or route-bundle-stats.json of the build to check",
   )
   .option(
     "--baseline <file>",
-    "Path to main's snapshot or route-bundle-stats.json (bootstrap mode if absent)",
+    "Snapshot or route-bundle-stats.json to compare with. Without it, only the current sizes are shown",
   )
   .addOption(
     new Option(
       "--format <format>",
-      "Output format. 'terminal' (default) renders an aligned cli-table3 view for local debugging; 'markdown' writes a GitHub-flavored table to $GITHUB_STEP_SUMMARY and is the CI-only mode.",
+      "Output format. 'terminal' prints a table to stdout. 'markdown' writes a GitHub-flavored table to $GITHUB_STEP_SUMMARY when it is set, otherwise to stdout",
     )
       .choices([...FORMATS])
       .default("terminal" satisfies Format),
   )
   .option(
     "--config <file>",
-    "Path to route-bundle-size.config.json (default: the one in the current directory, if any)",
+    "Path to the config file. Without it, route-bundle-size.config.json in the current directory is used if it exists",
   )
   .option(
     "--no-exclude",
-    "Ignore the configured exclude patterns. Useful in diagnostic mode — bare pages surface pure shared-chunk drift.",
+    'Check every route and ignore the "exclude" patterns from the config',
   )
   .action(
     (options: {
@@ -68,14 +117,35 @@ const diffCommand = new Command("diff")
       const exclude = options.exclude ? config.exclude : [];
       const budget = config.budget;
 
-      const current = loadSizes(options.current, exclude);
+      const current = loadInput(options.current, exclude);
 
       if (options.baseline === undefined || !fs.existsSync(options.baseline)) {
-        writeSummary(renderBootstrap(current.sizes));
+        if (options.baseline !== undefined) {
+          console.error(
+            formatMessage(
+              "warning",
+              `Baseline file not found: ${options.baseline}. Nothing was compared, showing current sizes only.`,
+            ),
+          );
+        }
+
+        assertMaxSizeComparable(current, budget);
+
+        const metric =
+          budget.metric === "compressed" && !current.compressed
+            ? "raw"
+            : budget.metric;
+        const { rows, anyExceeded } = buildRows(current.sizes, new Map(), {
+          ...budget,
+          metric,
+        });
+
+        writeSummary(renderBootstrap(rows, metric));
+        reportVerdict(rows, anyExceeded, budget);
         return;
       }
 
-      const baseline = loadSizes(options.baseline, exclude);
+      const baseline = loadInput(options.baseline, exclude);
       assertComparable(current, baseline, budget.metric);
 
       const { rows, anyExceeded } = buildRows(
@@ -96,10 +166,7 @@ const diffCommand = new Command("diff")
         writeSummary(output);
       }
 
-      if (anyExceeded) {
-        console.error("::error::Bundle size regression — see step summary");
-        process.exit(1);
-      }
+      reportVerdict(rows, anyExceeded, budget);
     },
   );
 
@@ -107,9 +174,10 @@ const measureCommand = new Command("measure")
   .description(
     "Gzip every unique first-load chunk once and write a snapshot with raw + compressed bytes per route.",
   )
-  .requiredOption(
+  .option(
     "--app-dir <dir>",
     "App root that the chunk paths in the stats file resolve against (the directory that contains .next)",
+    ".",
   )
   .option(
     "--stats <file>",
@@ -123,6 +191,15 @@ const measureCommand = new Command("measure")
       statsFile,
     });
 
+    if (snapshot.routes.length === 0) {
+      console.error(
+        formatMessage(
+          "warning",
+          `${statsFile} lists no routes, so the snapshot is empty.`,
+        ),
+      );
+    }
+
     writeSnapshot(options.out, snapshot);
 
     console.log(
@@ -130,20 +207,45 @@ const measureCommand = new Command("measure")
     );
   });
 
+const { version } = createRequire(import.meta.url)("../package.json") as {
+  version: string;
+};
+
 const program = new Command();
 
 program
   .name("route-bundle-size")
   .description(
-    "Per-route bundle size budget for Next.js builds: measure compressed sizes, diff against a baseline, exit 1 on regression.",
-  );
+    "Per-route bundle size budget for Next.js Turbopack builds: measure compressed sizes, diff against a baseline, exit 1 on regression.",
+  )
+  .version(version);
 
 program.addCommand(diffCommand, { isDefault: true });
 program.addCommand(measureCommand);
 
-try {
-  program.parse();
-} catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
+const commandNames = program.commands.map((command) => command.name());
+const firstArg = process.argv[2];
+
+if (
+  firstArg !== undefined &&
+  !firstArg.startsWith("-") &&
+  !commandNames.includes(firstArg) &&
+  firstArg !== "help"
+) {
+  console.error(
+    `error: unknown command '${firstArg}'. Commands: ${commandNames.join(", ")}.`,
+  );
+  process.exitCode = 1;
+} else {
+  try {
+    program.parse();
+  } catch (error) {
+    console.error(
+      formatMessage(
+        "error",
+        error instanceof Error ? error.message : String(error),
+      ),
+    );
+    process.exitCode = 1;
+  }
 }

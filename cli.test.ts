@@ -1,13 +1,17 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { afterEach, describe, expect, it } from "@jest/globals";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cliPath = path.join(here, "src", "cli.ts");
+const tsxLoader = pathToFileURL(
+  createRequire(import.meta.url).resolve("tsx"),
+).href;
 const fixturePath = path.join(
   here,
   "fixtures/sample-build/diagnostics/route-bundle-stats.json",
@@ -24,7 +28,7 @@ afterEach(() => {
 const tmpPath = (label: string): string => {
   const file = path.join(
     os.tmpdir(),
-    `bundle-size-cli-${label}-${process.pid}-${Math.random()}.json`,
+    `route-bundle-size-cli-${label}-${process.pid}-${Math.random()}.json`,
   );
   tmpFiles.push(file);
   return file;
@@ -47,13 +51,18 @@ const rawConfig = (): string =>
     },
   });
 
-const runCli = (args: string[]) => {
+const runCli = (
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+) => {
   const env = { ...process.env };
   delete env.GITHUB_STEP_SUMMARY;
+  delete env.GITHUB_ACTIONS;
 
-  return spawnSync("node", ["--import", "tsx", cliPath, ...args], {
+  return spawnSync("node", ["--import", tsxLoader, cliPath, ...args], {
     encoding: "utf8",
-    env,
+    cwd: options.cwd,
+    env: { ...env, ...options.env },
   });
 };
 
@@ -63,7 +72,9 @@ const writeFixture = (route: string, bytes: number): string =>
   ]);
 
 const makeAppDir = (chunkBytes: number): string => {
-  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), "bundle-size-app-"));
+  const appDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "route-bundle-size-app-"),
+  );
   tmpFiles.push(appDir);
 
   const chunkDir = path.join(appDir, ".next", "static", "chunks");
@@ -91,7 +102,7 @@ const makeAppDir = (chunkBytes: number): string => {
   return appDir;
 };
 
-describe("bundle-size CLI (e2e)", () => {
+describe("route-bundle-size CLI (e2e)", () => {
   it("default format (terminal): regression exits 1 and prints the box", () => {
     const baseline = writeFixture("/", 1_000_000);
     const current = writeFixture("/", 1_500_000);
@@ -104,10 +115,12 @@ describe("bundle-size CLI (e2e)", () => {
       rawConfig(),
     ]);
     expect(result.status).toBe(1);
-    // Box-drawing chars are the load-bearing terminal-format signal.
+    // Box-drawing chars show that the terminal format was used.
     expect(result.stdout).toMatch(/[┌┐└┘│─]/);
-    expect(result.stdout).toMatch(/\+500 kB[^\n]*🔴/);
-    expect(result.stderr).toMatch(/Bundle size regression/);
+    expect(result.stdout).toMatch(/\+488 KiB[^\n]*🔴/);
+    expect(result.stderr).toBe(
+      "Bundle size budget exceeded for 1 route(s): / (limit +50 KiB or +10%)\n",
+    );
   });
 
   it("--format markdown: regression exits 1 and prints a markdown table", () => {
@@ -124,16 +137,118 @@ describe("bundle-size CLI (e2e)", () => {
       rawConfig(),
     ]);
     expect(result.status).toBe(1);
-    expect(result.stdout).toMatch(/## 📦 Bundle size/);
-    // Pipe-delimited table cell is the load-bearing markdown signal.
+    expect(result.stdout).toMatch(/## Bundle size/);
+    // A pipe-delimited table cell shows that the markdown format was used.
     expect(result.stdout).toMatch(/\| `\/` +\|/);
-    expect(result.stdout).toMatch(/\+500 kB[^\n]*🔴/);
+    expect(result.stdout).toMatch(/\+488 KiB[^\n]*🔴/);
   });
 
   it("bootstrap mode: missing baseline exits 0 with 'baseline pending'", () => {
     const result = runCli(["--current", fixturePath, "--config", rawConfig()]);
     expect(result.status).toBe(0);
     expect(result.stdout).toMatch(/Baseline not yet established/);
+  });
+
+  it("a missing baseline file exits 0 and warns with the path", () => {
+    const missing = path.join(os.tmpdir(), "route-bundle-size-missing.json");
+    const result = runCli([
+      "--current",
+      fixturePath,
+      "--baseline",
+      missing,
+      "--config",
+      rawConfig(),
+    ]);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/Baseline not yet established/);
+    expect(result.stderr).toBe(
+      `Warning: Baseline file not found: ${missing}. Nothing was compared, showing current sizes only.\n`,
+    );
+  });
+
+  it("an empty stats file exits 0 and warns with the file name", () => {
+    const empty = writeJson("stats", []);
+    const diffed = runCli([
+      "--current",
+      empty,
+      "--baseline",
+      empty,
+      "--config",
+      rawConfig(),
+    ]);
+
+    expect(diffed.status).toBe(0);
+    expect(diffed.stderr).toMatch(
+      `Warning: No routes to check in ${empty}. The file lists no routes, or "exclude" removes all of them.`,
+    );
+
+    const measured = runCli([
+      "measure",
+      "--app-dir",
+      path.dirname(empty),
+      "--stats",
+      empty,
+      "--out",
+      tmpPath("snapshot"),
+    ]);
+
+    expect(measured.status).toBe(0);
+    expect(measured.stderr).toBe(
+      `Warning: ${empty} lists no routes, so the snapshot is empty.\n`,
+    );
+  });
+
+  it("prints the version", () => {
+    const { version } = JSON.parse(
+      fs.readFileSync(path.join(here, "package.json"), "utf8"),
+    );
+    const result = runCli(["--version"]);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(`${version}\n`);
+  });
+
+  it("an unknown command name is reported as unknown", () => {
+    const result = runCli(["mesure", "--app-dir", "."]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe(
+      "error: unknown command 'mesure'. Commands: diff, measure.\n",
+    );
+  });
+
+  it("adds the GitHub prefix only under GitHub Actions", () => {
+    const baseline = writeFixture("/", 1_000_000);
+    const current = writeFixture("/", 1_500_000);
+    const missing = path.join(os.tmpdir(), "route-bundle-size-missing.json");
+    const config = rawConfig();
+    const regression = ["--current", current, "--baseline", baseline];
+    const noBaseline = ["--current", current, "--baseline", missing];
+    const github = { env: { GITHUB_ACTIONS: "true" } };
+
+    expect(runCli([...regression, "--config", config]).stderr).toBe(
+      "Bundle size budget exceeded for 1 route(s): / (limit +50 KiB or +10%)\n",
+    );
+    expect(runCli([...regression, "--config", config], github).stderr).toBe(
+      "::error::Bundle size budget exceeded for 1 route(s): / (limit +50 KiB or +10%)\n",
+    );
+    expect(runCli([...noBaseline, "--config", config]).stderr).toMatch(
+      /^Warning: Baseline file not found/,
+    );
+    expect(runCli([...noBaseline, "--config", config], github).stderr).toMatch(
+      /^::warning::Baseline file not found/,
+    );
+  });
+
+  it("prefixes thrown errors under GitHub Actions", () => {
+    const missing = path.join(os.tmpdir(), "route-bundle-size-missing.json");
+    const result = runCli(["--current", missing, "--config", rawConfig()], {
+      env: { GITHUB_ACTIONS: "true" },
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/^::error::/);
   });
 
   it("diff is the default command, and works when named explicitly", () => {
@@ -265,7 +380,19 @@ describe("bundle-size CLI (e2e)", () => {
     ]);
     expect(grown.status).toBe(1);
     expect(grown.stdout).toMatch(/🔴/);
-    expect(grown.stderr).toMatch(/Bundle size regression/);
+    expect(grown.stderr).toMatch(
+      /^Bundle size budget exceeded for 1 route\(s\): \/ /,
+    );
+  });
+
+  it("measure uses the current directory when app-dir is omitted", () => {
+    const out = tmpPath("snapshot");
+    const result = runCli(["measure", "--out", out], {
+      cwd: makeAppDir(4096),
+    });
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(fs.readFileSync(out, "utf8")).routes[0].route).toBe("/");
   });
 
   it("refuses a snapshot route that carries null compressedBytes", () => {
@@ -294,6 +421,83 @@ describe("bundle-size CLI (e2e)", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/compressedBytes/);
+  });
+
+  it("exits 1 without a baseline when a route is above maxSize", () => {
+    const current = writeFixture("/", 1_000_000);
+    const result = runCli([
+      "--current",
+      current,
+      "--config",
+      writeJson("config", { budget: { metric: "raw", maxSize: "900kb" } }),
+    ]);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toMatch(/Baseline not yet established/);
+    expect(result.stdout).toMatch(/\| 977 KiB 🔴 +\|/);
+    expect(result.stdout).toMatch(/🔴 larger than its max size/);
+    expect(result.stderr).toBe(
+      "Bundle size budget exceeded for 1 route(s): / (max size 900 KiB)\n",
+    );
+  });
+
+  it("exits 1 when only an override limit is broken", () => {
+    const baseline = writeFixture("/editor", 100_000);
+    const current = writeFixture("/editor", 104_000);
+    const config = writeJson("config", {
+      budget: {
+        metric: "raw",
+        overrides: [{ match: "/editor", maxIncreasePercent: 2 }],
+      },
+    });
+    const result = runCli([
+      "--current",
+      current,
+      "--baseline",
+      baseline,
+      "--config",
+      config,
+    ]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe(
+      "Bundle size budget exceeded for 1 route(s): /editor (limit +30 KiB or +2%)\n",
+    );
+  });
+
+  it("warns about an override that matches no route and keeps the exit code", () => {
+    const stats = writeFixture("/dashboard", 1_000);
+    const result = runCli([
+      "--current",
+      stats,
+      "--baseline",
+      stats,
+      "--config",
+      writeJson("config", {
+        budget: { metric: "raw", overrides: [{ match: "/dashbord" }] },
+      }),
+    ]);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe(
+      'Warning: Override "/dashbord" matches no route.\n',
+    );
+  });
+
+  it("refuses a compressed maxSize check on raw stats without a baseline", () => {
+    const result = runCli([
+      "--current",
+      writeFixture("/", 1_000),
+      "--config",
+      writeJson("config", {
+        budget: { overrides: [{ match: "/", maxSize: "100kb" }] },
+      }),
+    ]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(
+      /Budget metric is "compressed" but current has no compressed data/,
+    );
   });
 
   it("a zero budget does not flag byte-identical inputs", () => {

@@ -26,7 +26,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value);
 
-const isStringArray = (value: unknown): value is string[] =>
+export const isStringArray = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every((item) => typeof item === "string");
 
 export const parseRawStats = (value: unknown, source: string): RawEntry[] => {
@@ -68,7 +68,7 @@ export const readJsonFile = (filePath: string): unknown => {
 export const readRawStats = (filePath: string): RawEntry[] => {
   if (!fs.existsSync(filePath)) {
     throw new Error(
-      `Stats file not found: ${filePath}. A Turbopack production build on Next.js >= 16.2 writes this file.`,
+      `Stats file not found: ${filePath}. Possible causes: --app-dir does not point to the app root; the app was built with webpack (next build --webpack) or with Next.js older than 16.2, which write no stats file; next.config sets a custom distDir, so pass --stats <app-dir>/<distDir>/diagnostics/route-bundle-stats.json.`,
     );
   }
 

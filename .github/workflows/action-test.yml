@@ -1,0 +1,120 @@
+name: Action self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FIXTURE_INSTALL_COMMAND: ${{ github.event_name == 'schedule' && 'npm ci && npm install --no-save next@canary' || 'npm ci' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pack CLI
+        id: pack
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP"
+          version="$(node -p 'require("./package.json").version')"
+          tarball="$RUNNER_TEMP/route-bundle-size-$version.tgz"
+          test -f "$tarball"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Run action without changes
+        id: unchanged
+        uses: ./
+        with:
+          app-dir: fixtures/next-app
+          base: HEAD
+          package: ${{ steps.pack.outputs.tarball }}
+          install-command: ${{ env.FIXTURE_INSTALL_COMMAND }}
+
+      - name: Check report without changes
+        env:
+          REPORT: ${{ steps.unchanged.outputs.report }}
+        run: |
+          report="${REPORT:-$RUNNER_TEMP/route-bundle-size/report.md}"
+          cat "$report"
+          if ! grep -qF "\`/about\`" "$report"; then
+            echo "::error::The report has no row for /about."
+            exit 1
+          fi
+          route_rows="$(grep -E "^\| \`" "$report")"
+          if [[ "$route_rows" == *🔴* ]]; then
+            echo "::error::A route row shows a regression although nothing changed."
+            exit 1
+          fi
+
+      - name: Commit lodash import on the home page
+        working-directory: fixtures/next-app
+        run: |
+          rm -f "$RUNNER_TEMP/route-bundle-size/report.md"
+          cat > app/page.js <<'EOF'
+          "use client";
+
+          import _ from "lodash";
+
+          export default function Home() {
+            return <h1>{_.startCase(_.toLower("HOME PAGE"))}</h1>;
+          }
+          EOF
+          git add app/page.js
+          git -c user.name="route-bundle-size self-test" -c user.email="self-test@users.noreply.github.com" \
+            commit --quiet -m "Import lodash on the home page"
+
+      - name: Run action with regression
+        id: regression
+        continue-on-error: true
+        uses: ./
+        with:
+          app-dir: fixtures/next-app
+          base: HEAD~1
+          package: ${{ steps.pack.outputs.tarball }}
+          install-command: ${{ env.FIXTURE_INSTALL_COMMAND }}
+
+      - name: Check report with regression
+        env:
+          OUTCOME: ${{ steps.regression.outcome }}
+          REPORT: ${{ steps.regression.outputs.report }}
+        run: |
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::Expected the action to fail on regression, got outcome '$OUTCOME'."
+            exit 1
+          fi
+          report="${REPORT:-$RUNNER_TEMP/route-bundle-size/report.md}"
+          cat "$report"
+          if ! home_row="$(grep -E "^\| \`/\` +\|" "$report")"; then
+            echo "::error::The report has no row for /."
+            exit 1
+          fi
+          if ! about_row="$(grep -E "^\| \`/about\` +\|" "$report")"; then
+            echo "::error::The report has no row for /about."
+            exit 1
+          fi
+          if [[ "$home_row" != *🔴* ]]; then
+            echo "::error::The row for / does not show a regression: $home_row"
+            exit 1
+          fi
+          if [[ "$about_row" == *🔴* ]]; then
+            echo "::error::The row for /about shows a regression: $about_row"
+            exit 1
+          fi

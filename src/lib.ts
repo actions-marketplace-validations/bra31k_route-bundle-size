@@ -5,13 +5,17 @@ import { markdownTable } from "markdown-table";
 import picomatch from "picomatch";
 import prettyBytes from "pretty-bytes";
 
-import type { Budget, Metric } from "./config.js";
+import type { Budget, Limits, Metric, Override } from "./config.js";
 import { parseRawStats, parseSnapshot, readJsonFile } from "./stats.js";
 
 export const FORMATS = ["markdown", "terminal"] as const;
 export type Format = (typeof FORMATS)[number];
 
-export const MIN_DISPLAY = 250;
+const MIN_DISPLAY = 250;
+const MAX_LISTED_ROUTES = 5;
+
+export const formatBytes = (bytes: number): string =>
+  prettyBytes(bytes, { binary: true });
 
 export type RouteStats = {
   bytes: number;
@@ -25,8 +29,11 @@ export type LoadedSizes = {
   sizes: Sizes;
 };
 
+const escapeBrackets = (pattern: string): string =>
+  pattern.replace(/[[\]]/g, "\\$&");
+
 const routeMatcher = (exclude: string[]): ((route: string) => boolean) =>
-  picomatch(exclude, { dot: true });
+  picomatch(exclude.map(escapeBrackets), { dot: true });
 
 export const isExcluded = (route: string, exclude: string[]): boolean =>
   routeMatcher(exclude)(route);
@@ -38,7 +45,9 @@ export type Row = {
   delta: number;
   deltaPercent: number | null;
   chunkDelta: number;
+  limits: Limits;
   exceeded: boolean;
+  overMaxSize: boolean;
 };
 
 export const loadSizes = (filePath: string, exclude: string[]): LoadedSizes => {
@@ -89,8 +98,10 @@ export const loadSizes = (filePath: string, exclude: string[]): LoadedSizes => {
   return { compressed: true, sizes };
 };
 
-export const hasCompressedData = (loaded: LoadedSizes): boolean =>
-  loaded.compressed;
+const noCompressedDataError = (sides: string[]): Error =>
+  new Error(
+    `Budget metric is "compressed" but ${sides.join(" and ")} ${sides.length > 1 ? "have" : "has"} no compressed data. Produce snapshots with the "measure" command, or set "budget.metric" to "raw" in the config.`,
+  );
 
 export const assertComparable = (
   current: LoadedSizes,
@@ -102,19 +113,32 @@ export const assertComparable = (
   }
 
   const uncompressed = [
-    hasCompressedData(current) ? null : "current",
-    hasCompressedData(baseline) ? null : "baseline",
+    current.compressed ? null : "current",
+    baseline.compressed ? null : "baseline",
   ].filter((side): side is string => side !== null);
 
   if (uncompressed.length > 0) {
-    throw new Error(
-      `Budget metric is "compressed" but ${uncompressed.join(" and ")} ${uncompressed.length > 1 ? "have" : "has"} no compressed data. Produce snapshots with the "measure" command, or set "budget.metric" to "raw" in the config.`,
-    );
+    throw noCompressedDataError(uncompressed);
+  }
+};
+
+export const assertMaxSizeComparable = (
+  current: LoadedSizes,
+  budget: Budget,
+): void => {
+  const hasMaxSize =
+    budget.maxSize !== null ||
+    budget.overrides.some((override) => override.maxSize !== undefined);
+
+  if (hasMaxSize && budget.metric === "compressed" && !current.compressed) {
+    throw noCompressedDataError(["current"]);
   }
 };
 
 const metricBytes = (stats: RouteStats, metric: Metric): number =>
   metric === "compressed" ? (stats.compressedBytes ?? 0) : stats.bytes;
+
+const isFailing = (row: Row): boolean => row.exceeded || row.overMaxSize;
 
 export const buildRows = (
   current: Sizes,
@@ -123,6 +147,15 @@ export const buildRows = (
 ): { rows: Row[]; anyExceeded: boolean } => {
   const allRoutes = new Set([...current.keys(), ...baseline.keys()]);
   const rows: Row[] = [];
+  const globalLimits: Limits = {
+    maxIncrease: budget.maxIncrease,
+    maxIncreasePercent: budget.maxIncreasePercent,
+    maxSize: budget.maxSize,
+  };
+  const overrides = budget.overrides.map(({ match, ...limits }) => ({
+    matches: routeMatcher([match]),
+    limits,
+  }));
 
   let anyExceeded = false;
 
@@ -137,15 +170,21 @@ export const buildRows = (
     const deltaPercent =
       base !== null && baselineBytes > 0 ? (delta / baselineBytes) * 100 : null;
     const chunkDelta = (cur?.chunks ?? 0) - (base?.chunks ?? 0);
+    const limits: Limits = {
+      ...globalLimits,
+      ...overrides.find((override) => override.matches(route))?.limits,
+    };
     // New routes (no baseline) never exceeded — a fresh page legitimately ships
     // its full size as "delta", which would otherwise always trip the abs rule.
     const exceeded =
       base !== null &&
       delta > 0 &&
-      (delta >= budget.maxIncrease ||
-        (deltaPercent !== null && deltaPercent >= budget.maxIncreasePercent));
+      (delta >= limits.maxIncrease ||
+        (deltaPercent !== null && deltaPercent >= limits.maxIncreasePercent));
+    const overMaxSize =
+      cur !== null && limits.maxSize !== null && currentBytes > limits.maxSize;
 
-    if (exceeded) {
+    if (exceeded || overMaxSize) {
       anyExceeded = true;
     }
 
@@ -156,14 +195,31 @@ export const buildRows = (
       delta,
       deltaPercent,
       chunkDelta,
+      limits,
       exceeded,
+      overMaxSize,
     });
   }
 
-  rows.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+  rows.sort(
+    (a, b) =>
+      Number(isFailing(b)) - Number(isFailing(a)) ||
+      Math.abs(b.delta) - Math.abs(a.delta),
+  );
 
   return { rows, anyExceeded };
 };
+
+export const findUnmatchedOverrides = (
+  rows: Row[],
+  overrides: Override[],
+): string[] =>
+  overrides
+    .map((override) => override.match)
+    .filter((match) => {
+      const matches = routeMatcher([match]);
+      return !rows.some((row) => matches(row.route));
+    });
 
 export type Summary = {
   // Total unique routes across both snapshots (current ∪ baseline). New routes
@@ -171,106 +227,125 @@ export type Summary = {
   totalRoutes: number;
   routesCurrent: number;
   routesBaseline: number;
-  totalCurrent: number;
-  totalBaseline: number;
-  totalDelta: number;
-  totalDeltaPercent: number | null;
   avgCurrent: number;
   avgBaseline: number;
-  chunksCurrent: number;
-  chunksBaseline: number;
 };
 
 export const buildSummary = (rows: Row[], metric: Metric): Summary => {
   let totalCurrent = 0;
   let totalBaseline = 0;
-  let chunksCurrent = 0;
-  let chunksBaseline = 0;
   let routesCurrent = 0;
   let routesBaseline = 0;
 
   for (const row of rows) {
     if (row.current !== null) {
       totalCurrent += metricBytes(row.current, metric);
-      chunksCurrent += row.current.chunks;
       routesCurrent += 1;
     }
     if (row.baseline !== null) {
       totalBaseline += metricBytes(row.baseline, metric);
-      chunksBaseline += row.baseline.chunks;
       routesBaseline += 1;
     }
   }
-
-  const totalDelta = totalCurrent - totalBaseline;
-  const totalDeltaPercent =
-    totalBaseline > 0 ? (totalDelta / totalBaseline) * 100 : null;
 
   return {
     totalRoutes: rows.length,
     routesCurrent,
     routesBaseline,
-    totalCurrent,
-    totalBaseline,
-    totalDelta,
-    totalDeltaPercent,
     avgCurrent: routesCurrent > 0 ? totalCurrent / routesCurrent : 0,
     avgBaseline: routesBaseline > 0 ? totalBaseline / routesBaseline : 0,
-    chunksCurrent,
-    chunksBaseline,
   };
 };
 
-export const isNotableShrink = (row: Row, budget: Budget): boolean =>
+export const isNotableShrink = (row: Row): boolean =>
+  row.current !== null &&
   row.delta < 0 &&
-  (row.delta <= -budget.maxIncrease ||
+  (row.delta <= -row.limits.maxIncrease ||
     (row.deltaPercent !== null &&
-      row.deltaPercent <= -budget.maxIncreasePercent));
+      row.deltaPercent <= -row.limits.maxIncreasePercent));
 
-export const formatDelta = (row: Row, budget: Budget): string => {
+export const formatDelta = (row: Row): string => {
   // Sub-threshold deltas (incl. zero) are visual noise — show as "no change".
-  if (Math.abs(row.delta) < MIN_DISPLAY) {
+  if (!row.exceeded && Math.abs(row.delta) < MIN_DISPLAY) {
     return "—";
   }
 
   const sign = row.delta > 0 ? "+" : "";
-  const marker = row.exceeded
-    ? " 🔴"
-    : isNotableShrink(row, budget)
-      ? " 🟢"
-      : "";
+  const marker = row.exceeded ? " 🔴" : isNotableShrink(row) ? " 🟢" : "";
 
   // Removed: the size column already says "(removed)"; -100% is noise.
   if (row.current === null) {
-    return `${sign}${prettyBytes(row.delta)}${marker}`;
+    return `${sign}${formatBytes(row.delta)}${marker}`;
   }
 
   const percentLabel =
     row.deltaPercent === null
       ? "new"
       : `${sign}${row.deltaPercent.toFixed(1)}%`;
-  return `${sign}${prettyBytes(row.delta)} (${percentLabel})${marker}`;
+  return `${sign}${formatBytes(row.delta)} (${percentLabel})${marker}`;
 };
 
-export const formatSignedBytes = (bytes: number): string => {
-  if (bytes === 0) return "—";
-  const sign = bytes > 0 ? "+" : "";
-  return `${sign}${prettyBytes(bytes)}`;
-};
-
-export const formatPercent = (pct: number | null): string => {
-  if (pct === null) return "—";
-  const sign = pct > 0 ? "+" : "";
-  return `${sign}${pct.toFixed(1)}%`;
-};
-
-export const formatSignedInt = (n: number): string => {
+const formatSignedInt = (n: number): string => {
   if (n === 0) return "—";
   return n > 0 ? `+${n}` : `${n}`;
 };
 
-const budgetLegendSuffix = (budget: Budget): string =>
-  budget.metric === "compressed" ? " compressed" : "";
+const formatCurrent = (
+  row: Row,
+  metric: Metric,
+  removedLabel: string,
+): string => {
+  if (row.current === null) {
+    return removedLabel;
+  }
+
+  const marker = row.overMaxSize ? " 🔴" : "";
+  return `${formatBytes(metricBytes(row.current, metric))}${marker}`;
+};
+
+const budgetLegend = (budget: Budget): string => {
+  const maxSize =
+    budget.maxSize === null
+      ? ""
+      : `, or is larger than ${formatBytes(budget.maxSize)}`;
+  const notes = [
+    budget.metric === "compressed" ? "compressed" : null,
+    budget.overrides.length > 0 ? "some routes have their own limits" : null,
+  ].filter((note): note is string => note !== null);
+  const suffix = notes.length > 0 ? ` (${notes.join("; ")})` : "";
+
+  return `🔴 grew by at least ${formatBytes(budget.maxIncrease)} or ${budget.maxIncreasePercent}%${maxSize}${suffix}`;
+};
+
+const brokenLimits = ({ exceeded, overMaxSize, limits }: Row): string => {
+  const broken: string[] = [];
+
+  if (exceeded) {
+    broken.push(
+      `limit +${formatBytes(limits.maxIncrease)} or +${limits.maxIncreasePercent}%`,
+    );
+  }
+
+  if (overMaxSize && limits.maxSize !== null) {
+    broken.push(`max size ${formatBytes(limits.maxSize)}`);
+  }
+
+  return broken.join(", ");
+};
+
+export const formatFailure = (rows: Row[]): string => {
+  const failing = rows.filter(isFailing);
+  const listed = failing
+    .slice(0, MAX_LISTED_ROUTES)
+    .map((row) => `${row.route} (${brokenLimits(row)})`)
+    .join(", ");
+  const more =
+    failing.length > MAX_LISTED_ROUTES
+      ? ` (and ${failing.length - MAX_LISTED_ROUTES} more)`
+      : "";
+
+  return `Bundle size budget exceeded for ${failing.length} route(s): ${listed}${more}`;
+};
 
 export const renderMarkdown = (
   rows: Row[],
@@ -278,17 +353,15 @@ export const renderMarkdown = (
   budget: Budget,
 ): string => {
   if (rows.length === 0) {
-    return "## 📦 Bundle size\n\nNo client routes detected.";
+    return "## Bundle size\n\nNo client routes detected.";
   }
 
   const table = markdownTable([
     ["Route", "First Load JS", "Δ"],
     ...rows.map((r) => [
       `\`${r.route}\``,
-      r.current === null
-        ? "— (removed)"
-        : prettyBytes(metricBytes(r.current, budget.metric)),
-      formatDelta(r, budget),
+      formatCurrent(r, budget.metric, "— (removed)"),
+      formatDelta(r),
     ]),
   ]);
 
@@ -297,18 +370,16 @@ export const renderMarkdown = (
     "### Summary",
     "",
     `- **Routes:** ${summary.totalRoutes}`,
-    `- **Total:** ${prettyBytes(summary.totalBaseline)} → ${prettyBytes(summary.totalCurrent)} (${formatSignedBytes(summary.totalDelta)}, ${formatPercent(summary.totalDeltaPercent)})`,
-    `- **Avg per route:** ${prettyBytes(summary.avgBaseline)} → ${prettyBytes(summary.avgCurrent)}`,
-    `- **Chunks:** ${summary.chunksBaseline} → ${summary.chunksCurrent} (${formatSignedInt(summary.chunksCurrent - summary.chunksBaseline)})`,
+    `- **Avg per route:** ${formatBytes(summary.avgBaseline)} → ${formatBytes(summary.avgCurrent)}`,
   ];
 
   return [
-    "## 📦 Bundle size",
+    "## Bundle size",
     "",
     table,
     ...summaryLines,
     "",
-    `🔴 exceeds \`+${prettyBytes(budget.maxIncrease)}\` OR \`+${budget.maxIncreasePercent}%\`${budgetLegendSuffix(budget)} · 🟢 notable improvement (≥${prettyBytes(budget.maxIncrease)} OR ≥${budget.maxIncreasePercent}% smaller)`,
+    `${budgetLegend(budget)} · 🟢 notable improvement`,
   ].join("\n");
 };
 
@@ -318,13 +389,13 @@ export const renderTerminal = (
   budget: Budget,
 ): string => {
   if (rows.length === 0) {
-    return "📦 Bundle size: no client routes detected.";
+    return "Bundle size: no client routes detected.";
   }
 
   const table = new Table({
     head: ["Route", "Baseline", "Current", "Δ bytes", "Δ chunks"],
     colAligns: ["left", "right", "right", "right", "right"],
-    style: { head: [], border: [] },
+    style: { head: [], border: [], compact: true },
   });
 
   for (const row of rows) {
@@ -332,53 +403,38 @@ export const renderTerminal = (
       row.route,
       row.baseline === null
         ? "(new)"
-        : prettyBytes(metricBytes(row.baseline, budget.metric)),
-      row.current === null
-        ? "(removed)"
-        : prettyBytes(metricBytes(row.current, budget.metric)),
-      formatDelta(row, budget),
-      row.chunkDelta === 0
-        ? "—"
-        : `${row.chunkDelta > 0 ? "+" : ""}${row.chunkDelta}`,
+        : formatBytes(metricBytes(row.baseline, budget.metric)),
+      formatCurrent(row, budget.metric, "(removed)"),
+      formatDelta(row),
+      formatSignedInt(row.chunkDelta),
     ]);
   }
 
-  table.push([
-    { content: "TOTAL", hAlign: "left" },
-    prettyBytes(summary.totalBaseline),
-    prettyBytes(summary.totalCurrent),
-    `${formatSignedBytes(summary.totalDelta)} (${formatPercent(summary.totalDeltaPercent)})`,
-    formatSignedInt(summary.chunksCurrent - summary.chunksBaseline),
-  ]);
-  table.push([
-    { content: "avg per route", hAlign: "left" },
-    prettyBytes(summary.avgBaseline),
-    prettyBytes(summary.avgCurrent),
-    "",
-    "",
-  ]);
-
   return [
     table.toString(),
-    `🔴 exceeds +${prettyBytes(budget.maxIncrease)} OR +${budget.maxIncreasePercent}%${budgetLegendSuffix(budget)}   🟢 notable improvement   ${summary.totalRoutes} route(s)`,
+    `Avg per route: ${formatBytes(summary.avgBaseline)} → ${formatBytes(summary.avgCurrent)}`,
+    `${budgetLegend(budget)}   🟢 notable improvement   ${summary.totalRoutes} route(s)`,
   ].join("\n");
 };
 
-export const renderBootstrap = (sizes: Sizes): string => {
-  const sorted = [...sizes.entries()].sort((a, b) => b[1].bytes - a[1].bytes);
+export const renderBootstrap = (rows: Row[], metric: Metric): string => {
   const table = markdownTable([
     ["Route", "First Load JS"],
-    ...sorted.map(([route, stats]) => [
-      `\`${route}\``,
-      prettyBytes(stats.bytes),
+    ...rows.map((row) => [
+      `\`${row.route}\``,
+      formatCurrent(row, metric, "(removed)"),
     ]),
   ]);
+  const legend = rows.some((row) => row.overMaxSize)
+    ? ["", "🔴 larger than its max size"]
+    : [];
 
   return [
-    "## 📦 Bundle size",
+    "## Bundle size",
     "",
-    `Baseline not yet established. ${sizes.size} routes captured.`,
+    `Baseline not yet established. ${rows.length} route(s) captured. Sizes are ${metric}.`,
     "",
     table,
+    ...legend,
   ].join("\n");
 };

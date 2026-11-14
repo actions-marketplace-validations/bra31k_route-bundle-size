@@ -2,7 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as zlib from "node:zlib";
 
-import { readRawStats, type Snapshot, SNAPSHOT_SCHEMA_VERSION } from "./stats.js";
+import {
+  isStringArray,
+  readRawStats,
+  type Snapshot,
+  SNAPSHOT_SCHEMA_VERSION,
+} from "./stats.js";
 
 export const defaultStatsFile = (appDir: string): string =>
   path.join(appDir, ".next", "diagnostics", "route-bundle-stats.json");
@@ -21,6 +26,16 @@ const MISSING_CHUNKS_SHOWN = 5;
 
 export const measure = (options: MeasureOptions): MeasureResult => {
   const entries = readRawStats(options.statsFile);
+  const invalidChunkPathsIndex = entries.findIndex(
+    (entry) => !isStringArray(entry.firstLoadChunkPaths ?? []),
+  );
+
+  if (invalidChunkPathsIndex !== -1) {
+    throw new Error(
+      `Invalid stats file ${options.statsFile}: entry ${invalidChunkPathsIndex} must have "firstLoadChunkPaths" as an array of strings.`,
+    );
+  }
+
   const sizedWithoutChunks = entries.filter(
     (entry) =>
       entry.firstLoadUncompressedJsBytes > 0 &&

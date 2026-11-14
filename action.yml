@@ -1,0 +1,162 @@
+name: Route Bundle Size
+description: Compare per-route First Load JS of a Next.js build against the merge base and fail on regression.
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  app-dir:
+    description: Next.js app directory, relative to the repository root.
+    required: false
+    default: .
+  install-command:
+    description: Command that installs the app's dependencies.
+    required: false
+    default: npm ci
+  build-command:
+    description: Command that builds the app.
+    required: false
+    default: npx next build
+  base:
+    description: Git ref to compare against. Defaults to origin/<base branch of the pull request>.
+    required: false
+    default: ""
+  package:
+    description: npm spec of the CLI to install. Defaults to route-bundle-size at the version of this action.
+    required: false
+    default: ""
+
+outputs:
+  report:
+    description: Path to the markdown report file.
+    value: ${{ steps.compare.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve head and merge base
+      id: refs
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        BASE_INPUT: ${{ inputs.base }}
+        PR_BASE_REF: ${{ github.base_ref }}
+      run: |
+        base="$BASE_INPUT"
+        if [ -z "$base" ] && [ -n "$PR_BASE_REF" ]; then
+          base="origin/$PR_BASE_REF"
+        fi
+        if [ -z "$base" ]; then
+          echo "::error::No base ref to compare against. Set the 'base' input, for example 'base: origin/main'."
+          exit 1
+        fi
+        if ! merge_base="$(git merge-base "$base" HEAD)" || [ -z "$merge_base" ]; then
+          echo "::error::Could not find a merge base between '$base' and HEAD. Check out full history with actions/checkout and 'fetch-depth: 0'."
+          exit 1
+        fi
+        echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        echo "merge-base=$merge_base" >> "$GITHUB_OUTPUT"
+
+    - name: Install route-bundle-size CLI
+      id: cli
+      shell: bash
+      env:
+        PACKAGE_INPUT: ${{ inputs.package }}
+      run: |
+        spec="$PACKAGE_INPUT"
+        if [ -z "$spec" ]; then
+          version="$(node -p 'require(process.argv[1]).version' "$GITHUB_ACTION_PATH/package.json")"
+          spec="route-bundle-size@$version"
+        fi
+        prefix="$RUNNER_TEMP/route-bundle-size"
+        npm install --prefix "$prefix" "$spec"
+        echo "bin=$prefix/node_modules/.bin/route-bundle-size" >> "$GITHUB_OUTPUT"
+
+    - name: Install dependencies at head
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        INSTALL_COMMAND: ${{ inputs.install-command }}
+      run: eval "$INSTALL_COMMAND"
+
+    - name: Remove stale build stats
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      run: rm -f .next/diagnostics/route-bundle-stats.json
+
+    - name: Build head
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        BUILD_COMMAND: ${{ inputs.build-command }}
+      run: eval "$BUILD_COMMAND"
+
+    - name: Measure head
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        CLI: ${{ steps.cli.outputs.bin }}
+      run: '"$CLI" measure --app-dir . --out "$RUNNER_TEMP/route-bundle-size/current.json"'
+
+    - name: Check out merge base
+      id: checkout_base
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        MERGE_BASE: ${{ steps.refs.outputs.merge-base }}
+      run: git checkout --force --detach "$MERGE_BASE"
+
+    - name: Install dependencies at merge base
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        INSTALL_COMMAND: ${{ inputs.install-command }}
+      run: eval "$INSTALL_COMMAND"
+
+    - name: Remove head build stats
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      run: rm -f .next/diagnostics/route-bundle-stats.json
+
+    - name: Build merge base
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        BUILD_COMMAND: ${{ inputs.build-command }}
+      run: eval "$BUILD_COMMAND"
+
+    - name: Measure merge base
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        CLI: ${{ steps.cli.outputs.bin }}
+      run: '"$CLI" measure --app-dir . --out "$RUNNER_TEMP/route-bundle-size/baseline.json"'
+
+    - name: Return to head
+      if: always() && steps.checkout_base.outcome != 'skipped'
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        HEAD_SHA: ${{ steps.refs.outputs.head }}
+      run: git checkout --force --detach "$HEAD_SHA"
+
+    - name: Compare head with merge base
+      id: compare
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        CLI: ${{ steps.cli.outputs.bin }}
+      run: |
+        dir="$RUNNER_TEMP/route-bundle-size"
+        report="$dir/report.md"
+        rm -f "$report"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        status=0
+        GITHUB_STEP_SUMMARY="$report" "$CLI" diff \
+          --current "$dir/current.json" \
+          --baseline "$dir/baseline.json" \
+          --format markdown || status=$?
+        if [ -f "$report" ]; then
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        exit "$status"
