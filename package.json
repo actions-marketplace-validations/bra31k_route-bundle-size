@@ -1,7 +1,7 @@
 {
   "$schema": "https://www.schemastore.org/package.json",
   "name": "route-bundle-size",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Per-route bundle size budget for Next.js Turbopack builds: measure compressed sizes, diff against a baseline, exit 1 on regression.",
   "keywords": [
     "nextjs",
