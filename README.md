@@ -2,86 +2,11 @@
 
 Per-route first-load JS budget for Next.js Turbopack builds.
 
-Next.js 16 removed the per-route "First Load JS" column from the `next build` output ([vercel/next.js#83815](https://github.com/vercel/next.js/pull/83815)). Since 16.2, every Turbopack production build writes `.next/diagnostics/route-bundle-stats.json`, and this tool reads it. It measures the gzip size of each route's first-load JS and compares a PR with its merge base, so commits that land on the base branch later never count against the PR. It fails when a route grows past the budget or goes over its size limit. The cost is a second build in each PR run.
+It reads the route stats that `next build` writes to `.next/diagnostics/route-bundle-stats.json`, measures the gzip size of each route's first-load JS, and compares it with a baseline build. A route fails when it grows past the budget or goes over its size limit.
 
-## Requirements and limitations
+Requires Next.js 16.2+ with Turbopack (the default for `next build`) and Node.js 22.12+.
 
-- Next.js >= 16.2 with Turbopack, the default for `next build`. `next build --webpack` writes no stats file.
-- Node.js >= 22.12.
-- The stats file has no official docs and no stability promise. A Next.js release can change it, so this package stays on 0.x.
-- Only first-load JS is measured. App-router route handlers (`route.ts`) and middleware/proxy are not in the stats file.
-- With a custom `distDir`, pass `--stats <app-dir>/<distDir>/diagnostics/route-bundle-stats.json` to `measure`. The GitHub Action assumes `.next`.
-
-## GitHub Action
-
-The action builds the PR head and its merge base in one job, compares them, and writes the result to the job summary. It posts no PR comment and needs only `contents: read`, so it works for PRs from forks.
-
-```yaml
-name: Bundle size
-
-on:
-  pull_request:
-
-permissions:
-  contents: read
-
-jobs:
-  bundle-size:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }} # build the PR head, not GitHub's merge commit
-          fetch-depth: 0 # needed to find the merge base
-          persist-credentials: false
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-
-      - uses: bra31k/route-bundle-size@v0
-```
-
-Inputs, all optional:
-
-- `app-dir`: the Next.js app directory. Default `.`. The config file is read from `app-dir` at the PR head.
-- `install-command`: installs the dependencies. Default `npm ci`.
-- `build-command`: builds the app. Default `npx next build`.
-- `base`: the git ref to compare with. Default `origin/<base branch of the PR>`. Set it for events that are not pull requests, such as `push`.
-- `package`: the npm spec of the CLI. Default: `route-bundle-size` at the action's own version.
-
-Output:
-
-- `report`: the path to the markdown report.
-
-With pnpm, yarn or bun, set up the package manager before `setup-node`, set `install-command` (for example `pnpm install --frozen-lockfile`), and make the `cache:` value of `setup-node` match your lockfile or remove it. `@v0` moves with each 0.x release; to pin an exact version, use `@v0.2.1`.
-
-The job summary looks like this, with the example config from [Config](#config):
-
-```markdown
-## Bundle size
-
-| Route          | First Load JS | Δ                     |
-| -------------- | ------------- | --------------------- |
-| `/onboarding`  | 318 KiB 🔴    | +318 KiB (new)        |
-| `/dashboard`   | 292 KiB       | +37.1 KiB (+14.5%) 🔴 |
-| `/settings`    | — (removed)   | -185 KiB              |
-| `/pricing`     | 148 KiB       | -17.9 KiB (-10.8%) 🟢 |
-| `/`            | 162 KiB       | +470 B (+0.3%)        |
-| `/blog/[slug]` | 157 KiB       | —                     |
-| `/_not-found`  | 138 KiB       | —                     |
-
-### Summary
-
-- **Routes:** 7
-- **Avg per route:** 177 KiB → 203 KiB
-
-🔴 grew by at least 30 KiB or 10%, or is larger than 300 KiB (compressed; some routes have their own limits) · 🟢 notable improvement
-```
-
-## Other CI and local use
+## Usage
 
 ```bash
 # At the baseline commit
@@ -95,9 +20,32 @@ npx route-bundle-size measure --out /tmp/current.json
 npx route-bundle-size diff --current /tmp/current.json --baseline /tmp/baseline.json
 ```
 
+`diff` prints a table and exits `1` when a route is over budget. With the [example config](#config):
+
+```text
+┌──────────────┬──────────┬────────────┬───────────────────────┬──────────┐
+│ Route        │ Baseline │    Current │               Δ bytes │ Δ chunks │
+├──────────────┼──────────┼────────────┼───────────────────────┼──────────┤
+│ /onboarding  │    (new) │ 318 KiB 🔴 │        +318 KiB (new) │       +5 │
+│ /dashboard   │  255 KiB │    292 KiB │ +37.1 KiB (+14.5%) 🔴 │       +1 │
+│ /settings    │  185 KiB │  (removed) │              -185 KiB │       -6 │
+│ /pricing     │  166 KiB │    148 KiB │ -17.9 KiB (-10.8%) 🟢 │       -1 │
+│ /            │  161 KiB │    162 KiB │        +470 B (+0.3%) │        — │
+│ /blog/[slug] │  157 KiB │    157 KiB │                     — │        — │
+│ /_not-found  │  138 KiB │    138 KiB │                     — │        — │
+└──────────────┴──────────┴────────────┴───────────────────────┴──────────┘
+Avg per route: 177 KiB → 203 KiB
+🔴 grew by at least 30 KiB or 10%, or is larger than 300 KiB (compressed; some routes have their own limits)   🟢 notable improvement   7 route(s)
+Bundle size budget exceeded for 2 route(s): /onboarding (max size 300 KiB), /dashboard (limit +30 KiB or +10%)
+```
+
+The last line goes to stderr. Under GitHub Actions it starts with `::error::`, and GitHub shows it as an annotation.
+
+Sizes use the budget metric. Failing routes come first, then the rest by the size of the change. 🔴 on the Δ cell means the route broke the growth rule, and 🔴 on the size cell means it is larger than its `maxSize`. 🟢 means the route shrank by at least the budget. Changes under 250 B show as `—` unless the route failed. New routes never fail the growth rule, and removed routes never fail.
+
 In a monorepo, build the app and point `--app-dir` at it, for example `--app-dir apps/web`.
 
-On other CI systems, follow the steps in [`action.yml`](action.yml): build and measure the merge base and the head with the same CLI version, delete the old stats file before each build, then run `diff` at the head.
+In CI, build and measure the merge base and the head with the same CLI version, delete the old stats file before each build, then run `diff` at the head. On GitHub, the [GitHub Action](#github-action) does all of this in one step.
 
 ## Config
 
@@ -175,7 +123,7 @@ npx route-bundle-size diff \
 ```
 
 - `--current` (required): the snapshot to check.
-- `--baseline`: the snapshot to compare with. Without it, `diff` shows only the current sizes (see [Output](#output)). If the file does not exist, `diff` prints a warning and works as if no baseline was given.
+- `--baseline`: the snapshot to compare with. Without it, `diff` shows only the current sizes (see the example below). If the file does not exist, `diff` prints a warning and works as if no baseline was given.
 - `--format`: `terminal` (default) prints a table to stdout. `markdown` writes a GitHub-flavored table to the file in `$GITHUB_STEP_SUMMARY`, or to stdout when that variable is not set.
 - `--config`: path to the config file. Default: `route-bundle-size.config.json` in the current directory, if it exists.
 - `--no-exclude`: ignore the `exclude` patterns from the config.
@@ -184,30 +132,28 @@ Both inputs can be a `measure` snapshot or a raw `route-bundle-stats.json`. A ra
 
 `--no-exclude` helps find shared-chunk growth: pages-router `/api/*` entries carry only the `_app` chunks, which is why the example config excludes them.
 
-## Output
+With `--format markdown`, the same diff looks like this in the GitHub job summary:
 
-Terminal (`--format terminal`, the default), with the example config:
+```markdown
+## Bundle size
 
-```text
-┌──────────────┬──────────┬────────────┬───────────────────────┬──────────┐
-│ Route        │ Baseline │    Current │               Δ bytes │ Δ chunks │
-├──────────────┼──────────┼────────────┼───────────────────────┼──────────┤
-│ /onboarding  │    (new) │ 318 KiB 🔴 │        +318 KiB (new) │       +5 │
-│ /dashboard   │  255 KiB │    292 KiB │ +37.1 KiB (+14.5%) 🔴 │       +1 │
-│ /settings    │  185 KiB │  (removed) │              -185 KiB │       -6 │
-│ /pricing     │  166 KiB │    148 KiB │ -17.9 KiB (-10.8%) 🟢 │       -1 │
-│ /            │  161 KiB │    162 KiB │        +470 B (+0.3%) │        — │
-│ /blog/[slug] │  157 KiB │    157 KiB │                     — │        — │
-│ /_not-found  │  138 KiB │    138 KiB │                     — │        — │
-└──────────────┴──────────┴────────────┴───────────────────────┴──────────┘
-Avg per route: 177 KiB → 203 KiB
-🔴 grew by at least 30 KiB or 10%, or is larger than 300 KiB (compressed; some routes have their own limits)   🟢 notable improvement   7 route(s)
-Bundle size budget exceeded for 2 route(s): /onboarding (max size 300 KiB), /dashboard (limit +30 KiB or +10%)
+| Route          | First Load JS | Δ                     |
+| -------------- | ------------- | --------------------- |
+| `/onboarding`  | 318 KiB 🔴    | +318 KiB (new)        |
+| `/dashboard`   | 292 KiB       | +37.1 KiB (+14.5%) 🔴 |
+| `/settings`    | — (removed)   | -185 KiB              |
+| `/pricing`     | 148 KiB       | -17.9 KiB (-10.8%) 🟢 |
+| `/`            | 162 KiB       | +470 B (+0.3%)        |
+| `/blog/[slug]` | 157 KiB       | —                     |
+| `/_not-found`  | 138 KiB       | —                     |
+
+### Summary
+
+- **Routes:** 7
+- **Avg per route:** 177 KiB → 203 KiB
+
+🔴 grew by at least 30 KiB or 10%, or is larger than 300 KiB (compressed; some routes have their own limits) · 🟢 notable improvement
 ```
-
-The last line goes to stderr. Under GitHub Actions it starts with `::error::`, and GitHub shows it as an annotation.
-
-Sizes use the budget metric. Failing routes come first, then the rest by the size of the change. 🔴 on the Δ cell means the route broke the growth rule, and 🔴 on the size cell means it is larger than its `maxSize`. 🟢 means the route shrank by at least the budget. Changes under 250 B show as `—` unless the route failed. New routes never fail the growth rule, and removed routes never fail.
 
 Without a baseline, `diff` prints the current routes only and checks only `maxSize`. For both formats it writes this markdown table:
 
@@ -232,6 +178,61 @@ Exit codes:
 
 - `0`: no route failed.
 - `1`: a route failed, or an error occurred (bad config, unreadable input, missing chunk files).
+
+## GitHub Action
+
+The action builds the PR head and its merge base in one job, so commits that land on the base branch later never count against the PR. Each run costs a second build. It writes the result to the job summary, posts no PR comment and needs only `contents: read`, so it works for PRs from forks.
+
+```yaml
+name: Bundle size
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle-size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }} # build the PR head, not GitHub's merge commit
+          fetch-depth: 0 # needed to find the merge base
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: bra31k/route-bundle-size@v0
+```
+
+Inputs, all optional:
+
+- `app-dir`: the Next.js app directory. Default `.`. The config file is read from `app-dir` at the PR head.
+- `install-command`: installs the dependencies. Default `npm ci`.
+- `build-command`: builds the app. Default `npx next build`.
+- `base`: the git ref to compare with. Default `origin/<base branch of the PR>`. Set it for events that are not pull requests, such as `push`.
+- `package`: the npm spec of the CLI. Default: `route-bundle-size` at the action's own version.
+
+Output:
+
+- `report`: the path to the markdown report.
+
+With pnpm, yarn or bun, set up the package manager before `setup-node`, set `install-command` (for example `pnpm install --frozen-lockfile`), and make the `cache:` value of `setup-node` match your lockfile or remove it. `@v0` moves with each 0.x release; to pin an exact version, use `@v0.2.1`.
+
+The job summary shows the markdown report described under [`diff`](#diff).
+
+## Limitations
+
+- `next build --webpack` writes no stats file.
+- The stats file has no official docs and no stability promise. A Next.js release can change it, so this package stays on 0.x.
+- Only first-load JS is measured. App-router route handlers (`route.ts`) and middleware/proxy are not in the stats file.
+- With a custom `distDir`, pass `--stats <app-dir>/<distDir>/diagnostics/route-bundle-stats.json` to `measure`. The GitHub Action assumes `.next`.
 
 ## Development
 
