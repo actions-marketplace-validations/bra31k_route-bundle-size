@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "@jest/globals";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const cliPath = path.join(here, "src", "cli.ts");
+const cliPath = path.join(here, "..", "src", "cli.ts");
 const tsxLoader = pathToFileURL(
   createRequire(import.meta.url).resolve("tsx"),
 ).href;
@@ -201,7 +201,7 @@ describe("route-bundle-size CLI (e2e)", () => {
 
   it("prints the version", () => {
     const { version } = JSON.parse(
-      fs.readFileSync(path.join(here, "package.json"), "utf8"),
+      fs.readFileSync(path.join(here, "..", "package.json"), "utf8"),
     );
     const result = runCli(["--version"]);
 

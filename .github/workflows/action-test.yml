@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   self-test:
+    name: Fixture app
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -43,7 +44,7 @@ jobs:
         id: unchanged
         uses: ./
         with:
-          app-dir: fixtures/next-app
+          app-dir: test/fixtures/next-app
           base: HEAD
           package: ${{ steps.pack.outputs.tarball }}
           install-command: ${{ env.FIXTURE_INSTALL_COMMAND }}
@@ -65,7 +66,7 @@ jobs:
           fi
 
       - name: Commit lodash import on the home page
-        working-directory: fixtures/next-app
+        working-directory: test/fixtures/next-app
         run: |
           rm -f "$RUNNER_TEMP/route-bundle-size/report.md"
           cat > app/page.js <<'EOF'
@@ -86,7 +87,7 @@ jobs:
         continue-on-error: true
         uses: ./
         with:
-          app-dir: fixtures/next-app
+          app-dir: test/fixtures/next-app
           base: HEAD~1
           package: ${{ steps.pack.outputs.tarball }}
           install-command: ${{ env.FIXTURE_INSTALL_COMMAND }}

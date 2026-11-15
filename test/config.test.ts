@@ -10,7 +10,7 @@ import {
   loadConfig,
   parseByteSize,
   parseConfig,
-} from "./src/config";
+} from "../src/config";
 
 const created: string[] = [];
 

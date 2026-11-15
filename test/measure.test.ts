@@ -5,8 +5,8 @@ import * as zlib from "node:zlib";
 
 import { afterEach, describe, expect, it } from "@jest/globals";
 
-import { defaultStatsFile, measure, writeSnapshot } from "./src/measure";
-import type { RawEntry } from "./src/stats";
+import { defaultStatsFile, measure, writeSnapshot } from "../src/measure";
+import type { RawEntry } from "../src/stats";
 
 const created: string[] = [];
 

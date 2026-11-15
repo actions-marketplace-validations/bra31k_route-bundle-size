@@ -4,7 +4,7 @@ import * as path from "node:path";
 
 import { afterAll, describe, expect, it } from "@jest/globals";
 
-import type { Budget } from "./src/config";
+import type { Budget } from "../src/config";
 import {
   assertComparable,
   buildRows,
@@ -21,8 +21,8 @@ import {
   renderTerminal,
   type Row,
   type Sizes,
-} from "./src/lib";
-import type { SnapshotRoute } from "./src/stats";
+} from "../src/lib";
+import type { SnapshotRoute } from "../src/stats";
 
 const APP_EXCLUDE = [
   "/api/**",

@@ -11,5 +11,5 @@
     "esModuleInterop": true,
     "libReplacement": false
   },
-  "include": ["src", "*.test.ts"]
+  "include": ["src", "test"]
 }

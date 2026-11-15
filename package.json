@@ -51,5 +51,15 @@
     "ts-jest": "^29.4.6",
     "tsx": "^4.9.1",
     "typescript": "^6.0.3"
+  },
+  "jest": {
+    "preset": "ts-jest/presets/default-esm",
+    "testEnvironment": "node",
+    "extensionsToTreatAsEsm": [
+      ".ts"
+    ],
+    "moduleNameMapper": {
+      "^(\\.{1,2}/.*)\\.js$": "$1"
+    }
   }
 }
