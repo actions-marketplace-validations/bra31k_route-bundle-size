@@ -223,7 +223,7 @@ Output:
 
 - `report`: the path to the markdown report.
 
-With pnpm, yarn or bun, set up the package manager before `setup-node`, set `install-command` (for example `pnpm install --frozen-lockfile`), and make the `cache:` value of `setup-node` match your lockfile or remove it. `@v0` moves with each 0.x release; to pin an exact version, use `@v0.2.1`.
+With pnpm, yarn or bun, set up the package manager before `setup-node`, set `install-command` (for example `pnpm install --frozen-lockfile`), and make the `cache:` value of `setup-node` match your lockfile or remove it. `@v0` moves with each 0.x release; to pin an exact version, use `@v0.2.2`.
 
 The job summary shows the markdown report described under [`diff`](#diff).
 
