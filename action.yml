@@ -25,11 +25,18 @@ inputs:
     description: npm spec of the CLI to install. Defaults to route-bundle-size at the version of this action.
     required: false
     default: ""
+  analyze:
+    description: Set to "true" to also run next analyze on the merge base and the head and upload the report as an artifact. Needs Next.js 16.4+.
+    required: false
+    default: "false"
 
 outputs:
   report:
     description: Path to the markdown report file.
     value: ${{ steps.compare.outputs.report }}
+  analyze-dir:
+    description: Path to the bundle analyzer report folder. Empty when analyze is off or the analyzer failed.
+    value: ${{ steps.analyze_base.outputs.dir }}
 
 runs:
   using: composite
@@ -98,6 +105,19 @@ runs:
         CLI: ${{ steps.cli.outputs.bin }}
       run: '"$CLI" measure --app-dir . --out "$RUNNER_TEMP/route-bundle-size/current.json"'
 
+    - name: Analyze head
+      id: analyze_head
+      if: inputs.analyze == 'true'
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      run: |
+        rm -rf .next/diagnostics/analyze "$RUNNER_TEMP/route-bundle-size/analyze"
+        if npx next analyze --output --snapshot head; then
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::next analyze failed at the head, so there is no bundle analyzer report. The analyzer needs Next.js 16.4 or newer. The size check is not affected."
+        fi
+
     - name: Check out merge base
       id: checkout_base
       shell: bash
@@ -132,6 +152,28 @@ runs:
         CLI: ${{ steps.cli.outputs.bin }}
       run: '"$CLI" measure --app-dir . --out "$RUNNER_TEMP/route-bundle-size/baseline.json"'
 
+    - name: Analyze merge base
+      id: analyze_base
+      if: steps.analyze_head.outputs.ok == 'true'
+      shell: bash
+      working-directory: ${{ inputs.app-dir }}
+      env:
+        APP_DIR: ${{ inputs.app-dir }}
+      run: |
+        if npx next analyze --output --snapshot base; then
+          dir="$RUNNER_TEMP/route-bundle-size/analyze"
+          rm -rf "$dir"
+          cp -R .next/diagnostics/analyze "$dir"
+          name="bundle-analyzer"
+          if [ "$APP_DIR" != "." ]; then
+            name="bundle-analyzer-$(printf '%s' "$APP_DIR" | tr -c 'A-Za-z0-9._-' '-')"
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::next analyze failed at the merge base, so there is no bundle analyzer report. The analyzer needs Next.js 16.4 or newer at both commits. The size check is not affected."
+        fi
+
     - name: Return to head
       if: always() && steps.checkout_base.outcome != 'skipped'
       shell: bash
@@ -140,12 +182,23 @@ runs:
         HEAD_SHA: ${{ steps.refs.outputs.head }}
       run: git checkout --force --detach "$HEAD_SHA"
 
+    - name: Upload bundle analyzer report
+      id: analyze_upload
+      if: steps.analyze_base.outputs.dir != ''
+      continue-on-error: true
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.analyze_base.outputs.name }}
+        path: ${{ steps.analyze_base.outputs.dir }}
+        retention-days: 7
+
     - name: Compare head with merge base
       id: compare
       shell: bash
       working-directory: ${{ inputs.app-dir }}
       env:
         CLI: ${{ steps.cli.outputs.bin }}
+        ANALYZE_URL: ${{ steps.analyze_upload.outputs.artifact-url }}
       run: |
         dir="$RUNNER_TEMP/route-bundle-size"
         report="$dir/report.md"
@@ -157,6 +210,9 @@ runs:
           --baseline "$dir/baseline.json" \
           --format markdown || status=$?
         if [ -f "$report" ]; then
+          if [ -n "$ANALYZE_URL" ]; then
+            printf '\n**Why did it change?** Download the [Next.js bundle analyzer report](%s), unzip it, run `npx serve <folder>` and open `/compare?from=snapshot:base&to=snapshot:head`.\n' "$ANALYZE_URL" >> "$report"
+          fi
           cat "$report" >> "$GITHUB_STEP_SUMMARY"
         fi
         exit "$status"

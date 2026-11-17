@@ -26,9 +26,9 @@ node dist/cli.js diff --current test/fixtures/sample-build/diagnostics/route-bun
 - `test/*.test.ts`: Jest tests. `cli.test.ts` runs `src/cli.ts` through `tsx`, so it needs no build.
 - `test/fixtures/sample-build/`: synthetic stats file used by the tests and the CI smoke run.
 - `test/fixtures/next-app/`: a real Next.js app that the action self-test builds.
-- `action.yml`: composite GitHub Action. It builds head and merge base, measures both, then runs `diff`.
+- `action.yml`: composite GitHub Action. It builds head and merge base, measures both, then runs `diff`. With `analyze: true` it also runs `next analyze` on both commits and uploads the report.
 - `.github/workflows/ci.yml`: types, tests, build and smoke run on Node 22.12.0 and 26.
-- `.github/workflows/action-test.yml`: runs the action on `test/fixtures/next-app`, once without changes and once with a regression. A weekly run uses `next@canary`.
+- `.github/workflows/action-test.yml`: runs the action on `test/fixtures/next-app`, once without changes and once with a regression. A weekly run uses `next@canary`. The regression run sets `analyze: true` and checks the report folder.
 - `.github/workflows/release.yml`: publishes to npm when a GitHub release is published.
 
 ## Rules
@@ -48,6 +48,8 @@ node dist/cli.js diff --current test/fixtures/sample-build/diagnostics/route-bun
 - Keep all logic inline in `action.yml`. Do not add script files under `$GITHUB_ACTION_PATH`: in the self-test the action runs as `uses: ./`, and the merge-base checkout replaces those files mid-run.
 - By default the action installs the CLI from npm at the version in `package.json`. The self-test passes a packed tarball through the `package` input instead, so it tests the CLI and the action from the same commit.
 - Keep `action-test.yml` passing.
+- The analyzer is optional. A failed `next analyze` or upload prints a warning and never fails the action. Copy the analyzer folder as it is; do not read or change its files.
+- `actions/upload-artifact` is the only nested `uses:`. Pin it by commit SHA and add no other nested action.
 
 ## Releases
 
