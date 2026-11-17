@@ -4,6 +4,8 @@ Per-route first-load JS budget for Next.js Turbopack builds.
 
 It reads the route stats that `next build` writes to `.next/diagnostics/route-bundle-stats.json`, measures the gzip size of each route's first-load JS, and compares it with a baseline build. A route fails when it grows past the budget or goes over its size limit.
 
+route-bundle-size tells you that a route grew. The official [`next analyze`](https://nextjs.org/docs/app/guides/package-bundling) tells you why, and the GitHub Action can [attach its report](#bundle-analyzer-report).
+
 Requires Next.js 16.2+ with Turbopack (the default for `next build`) and Node.js 22.12+.
 
 ## Usage
@@ -218,14 +220,35 @@ Inputs, all optional:
 - `build-command`: builds the app. Default `npx next build`.
 - `base`: the git ref to compare with. Default `origin/<base branch of the PR>`. Set it for events that are not pull requests, such as `push`.
 - `package`: the npm spec of the CLI. Default: `route-bundle-size` at the action's own version.
+- `analyze`: set to `true` to also run `next analyze` on both commits and upload the report. Default `false`. See [Bundle analyzer report](#bundle-analyzer-report).
 
-Output:
+Outputs:
 
 - `report`: the path to the markdown report.
+- `analyze-dir`: the path to the bundle analyzer report folder. Empty when `analyze` is off or the analyzer failed.
 
-With pnpm, yarn or bun, set up the package manager before `setup-node`, set `install-command` (for example `pnpm install --frozen-lockfile`), and make the `cache:` value of `setup-node` match your lockfile or remove it. `@v0` moves with each 0.x release; to pin an exact version, use `@v0.2.2`.
+With pnpm, yarn or bun, set up the package manager before `setup-node`, set `install-command` (for example `pnpm install --frozen-lockfile`), and make the `cache:` value of `setup-node` match your lockfile or remove it. `@v0` moves with each 0.x release; to pin an exact version, use `@v0.3.0`.
 
 The job summary shows the markdown report described under [`diff`](#diff).
+
+### Bundle analyzer report
+
+```yaml
+      - uses: bra31k/route-bundle-size@v0
+        with:
+          analyze: true
+```
+
+The analyzer needs Next.js 16.4 or newer at both commits and no extra permissions. The report is uploaded as an artifact and kept for 7 days. If the analyzer or the upload fails, the action prints a warning and the size check still runs.
+
+To see why a route changed:
+
+1. Follow the link under "Why did it change?" in the job summary.
+2. Unzip the artifact.
+3. Run `npx serve <folder>`. Opening the HTML file directly does not work.
+4. Open `/compare?from=snapshot:base&to=snapshot:head`.
+
+The analyzer also counts in 1024-byte units but labels them KB. Its totals are larger because they include server-side chunks; the size check counts only the first-load JS sent to the browser.
 
 ## Limitations
 

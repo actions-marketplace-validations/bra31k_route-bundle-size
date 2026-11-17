@@ -64,6 +64,10 @@ jobs:
             echo "::error::A route row shows a regression although nothing changed."
             exit 1
           fi
+          if [ -e "$RUNNER_TEMP/route-bundle-size/analyze" ]; then
+            echo "::error::The bundle analyzer ran although the analyze input is off by default."
+            exit 1
+          fi
 
       - name: Commit lodash import on the home page
         working-directory: test/fixtures/next-app
@@ -91,11 +95,13 @@ jobs:
           base: HEAD~1
           package: ${{ steps.pack.outputs.tarball }}
           install-command: ${{ env.FIXTURE_INSTALL_COMMAND }}
+          analyze: true
 
       - name: Check report with regression
         env:
           OUTCOME: ${{ steps.regression.outcome }}
           REPORT: ${{ steps.regression.outputs.report }}
+          ANALYZE_DIR: ${{ steps.regression.outputs.analyze-dir }}
         run: |
           if [ "$OUTCOME" != "failure" ]; then
             echo "::error::Expected the action to fail on regression, got outcome '$OUTCOME'."
@@ -117,5 +123,23 @@ jobs:
           fi
           if [[ "$about_row" == *🔴* ]]; then
             echo "::error::The row for /about shows a regression: $about_row"
+            exit 1
+          fi
+          dir="${ANALYZE_DIR:-$RUNNER_TEMP/route-bundle-size/analyze}"
+          if [ ! -f "$dir/compare.html" ]; then
+            echo "::error::The bundle analyzer report has no compare.html in $dir."
+            exit 1
+          fi
+          snapshots="$(node -p 'require(process.argv[1]).snapshots.map((s) => s.name).sort().join(",")' "$dir/history/history.json")"
+          if [ "$snapshots" != "base,head" ]; then
+            echo "::error::Expected bundle analyzer snapshots 'base,head', got '$snapshots'."
+            exit 1
+          fi
+          if ! grep -qF "/artifacts/" "$report"; then
+            echo "::error::The report has no link to the bundle analyzer artifact."
+            exit 1
+          fi
+          if ! grep -qF "compare?from=snapshot:base&to=snapshot:head" "$report"; then
+            echo "::error::The report has no bundle analyzer compare path."
             exit 1
           fi
